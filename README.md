@@ -215,6 +215,115 @@ The AdvLoot window uses 1-based indices:
 
 Add to your CMake plugin list and build with the `test` preset.
 
+## Building in this fork (openvanilla)
+
+> Fork note. This section records what it took to build against the `openvanilla`
+> MacroQuest fork, where third-party plugins live in `plugins/` rather than upstream's
+> `src/plugins/`. Several of the changes below are in the **openvanilla** tree, not this
+> repo, so a `git pull` over there will silently undo them and the build will break
+> again — hence writing them down here, in a repo we control.
+
+### Changes in this repo (already committed)
+
+| File | Change | Why |
+|------|--------|-----|
+| `vcpkg.json` | port `name` → `mq-mcp-server` | MQ's overlay generator derives the port name from the **directory** name (`PORT_LOWER` in `cmake/vcpkg_manifest.cmake`), while vcpkg reads it from the manifest's `name` field. When they disagree nothing provides the port and vcpkg falls through to the upstream baseline: `error: the baseline does not contain an entry for port mq-mcp-server`. |
+| `CMakeLists.txt` | `../../Plugin.cmake` → `../../src/Plugin.cmake` | The upstream path is correct only at `src/plugins/<name>/`. From `plugins/<name>/` it needs the `src/` segment — the same include the vcxproj→CMake converter emits for the other `plugins/` dwellers (compare `plugins/MQ2EQBC/CMakeLists.txt`). |
+| `portfile.cmake` | added | Empty-package stub. MQ regenerates it when absent, but vcpkg convention is that `vcpkg.json` + `portfile.cmake` are both port *source*, so a fresh clone has a complete port definition. |
+
+`MQMCPServer.vcxproj` still carries an upstream-layout `ProjectReference` to
+`..\..\main\MQ2Main.vcxproj`, which resolves outside the repo from `plugins/`. It is
+unused when building through the generated `build/MacroQuest.sln` (CMake writes its own
+project), so it was left alone. Fix it if you ever want a standalone `MQMCPServer.sln`.
+
+### Prerequisites in the openvanilla tree (NOT in this repo)
+
+These are the ones a pull will revert. Re-apply as needed.
+
+1. **Enable custom plugins.** `MQ_BUILD_CUSTOM_PLUGINS` defaults `OFF`. Configure with
+   `-DMQ_BUILD_CUSTOM_PLUGINS=ON`, and create `custom_plugins.cmake` at the repo root —
+   `CMakePresets.json` points `MQ_CUSTOM_PLUGINS_FILE` at it, but it does not exist by
+   default. Without it the build auto-globs every directory under `plugins/`, including
+   scratch folders like `New folder`. One `add_subdirectory("plugins/<name>")` per line.
+
+2. **`src/Common.cmake`: `/std:c++17` → `/std:c++20`** *(tracked file — will conflict)*.
+   `Common.cmake` is the CMake port of `src/Common.props`, which specifies
+   `<LanguageStandard>stdcpp20`; the port mistranslated it, and the hard-coded flag also
+   silently overrode `CMAKE_CXX_STANDARD 20` from the root `CMakeLists.txt`. MQ core
+   genuinely needs C++20 — `src/routing/Network.cpp:681` calls
+   `std::unordered_set::contains`. Symptom: `error C2039: 'contains': is not a member of
+   std::unordered_set`. Building via the `.sln` reads `Common.props` and works, so this
+   only ever bites on the CMake path.
+
+3. **Placeholder for `src/main/ImGuiAlphaMask.h`** *(untracked)*. `src/main/CMakeLists.txt`
+   lists the header in `MQ2Main_HEADERS`, but only `ImGuiAlphaMask.cpp` was ever committed.
+   CMake treats a listed-but-absent source as fatal at generate time; MSBuild only warns.
+   Nothing `#include`s it, so an empty `#pragma once` is enough. Delete the placeholder
+   before pulling if upstream ever commits the real header — an untracked file blocks the
+   checkout. Symptom: `Cannot find source file: ImGuiAlphaMask.h`.
+
+4. **Placeholder for `data/resources/ItemDB.txt`** *(untracked)*. Same cause, via
+   `MQ2Main_OTHERFILES`. Nothing in the build copies `data/resources/`, so the contents do
+   not matter; copying the real file from an MQ install is the easy route.
+
+5. **Delete stale `src/routing/*.pb.{h,cc}`** *(untracked build artifacts)*.
+   `protobuf_generate` has an empty `PROTOC_OUT_DIR` and emits into the build directory,
+   but `src/routing/` sits earlier on the include path, so leftover generated files there
+   shadow the fresh ones. If they came from a newer protoc than the current vcpkg baseline
+   provides, the build demands a protobuf runtime that is not installed. Symptom:
+   `Cannot open include file: 'google/protobuf/runtime_version.h'`. Delete the four files
+   and let the build regenerate them.
+
+6. **`include/mq/contrib/glm/glmUtils.h` needs `#include <array>`** *(tracked file — will
+   conflict)*. It uses `std::array` in `GetVec3SetFromString` but never included `<array>`;
+   it came in transitively until MSVC 14.44, whose `<utility>` only forward-declares
+   `std::array`. Symptom: `error C2027: use of undefined type 'std::array<glm::vec3,2>'`.
+   The same header also uses `std::string_view` without including it — still resolving
+   transitively today, so expect the same failure there on a future toolset bump.
+
+### Linking MQ2Main itself (not needed for this plugin)
+
+Two further failures block a full `MQ2Main.dll` link. **Both are vcpkg port problems, not
+MQ code**, and neither has to be solved to build this plugin — see the workaround below.
+
+- **crashpad debug/release mixing.** `crashpadConfig.cmake` resolves its libraries with a
+  bare `find_library(_LIB ${LIB_NAME})` and no debug/release distinction. vcpkg keeps
+  `debug/lib` on the search path, so a Release link picks up `MTd_StaticDebug` objects:
+  `LNK2038: mismatch detected for 'RuntimeLibrary'` (and `_ITERATOR_DEBUG_LEVEL`), repeated
+  for every crashpad object.
+- **`LNK1104: cannot open file 'absl_base.lib'`.** Nothing in MQ source or the generated
+  vcxproj asks for abseil, and abseil is not installed; the reference most likely comes
+  from a `/DEFAULTLIB` directive baked into `libprotobuf.lib`. Note the installed protobuf
+  is 3.21.12 while older generated `.pb` files in this tree came from 6.33.4, so the
+  dependency set has shifted at some point.
+
+### Build
+
+```
+cmake --preset live -DMQ_BUILD_CUSTOM_PLUGINS=ON
+cmake --build build --config Release --target MQMCPServer
+```
+
+**Workaround if MQ2Main will not link.** This plugin only needs `MQ2Main.lib` — an import
+library, i.e. export names — not a freshly linked `MQ2Main.dll`. Given a previously built
+`MQ2Main.lib` (and `routing.lib`, `pluginapi.lib`, `eqlib.lib`, which do build), place the
+import lib at `build/lib/release/MQ2Main.lib` and build the plugin project alone:
+
+```
+MSBuild.exe build/plugins/mq-mcp-server/MQMCPServer.vcxproj \
+    -p:Configuration=Release -p:Platform=x64 -p:BuildProjectReferences=false
+```
+
+`BuildProjectReferences=false` is what skips the broken MQ2Main link. Output lands at
+`build/bin/release/plugins/MQMCPServer.dll`; copy it into your MQ install's `plugins/`.
+Be aware that a *failed* MQ2Main link deletes any existing `build/bin/release/MQ2Main.dll`,
+so keep a copy if you depend on that one.
+
+The presets need CMake ≥ 3.30 (`"version": 9`). Visual Studio 2022 ships a new enough one
+at `Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe`; a mingw CMake on
+`PATH` may be too old. The first configure builds `cpp-httplib` and `nlohmann-json` from
+source and takes ~17 minutes; later ones are seconds.
+
 ## Usage with an MCP Client
 
 Add the server to your MCP client config:
