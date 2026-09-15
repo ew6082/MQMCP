@@ -82,14 +82,22 @@ static void EnqueueCommand(std::string cmd)
 // structures that the game thread mutates every frame.
 //============================================================================
 
+// A request carries a *list* of expressions so a caller can read many values
+// from one consistent game frame. Evaluating them one per request would cost a
+// round trip and a pulse each, and worse, would sample different frames -- so
+// position, target and distance could disagree with one another.
 struct TloQuery
 {
-	std::string               expr;
-	std::promise<std::string> result;
+	std::vector<std::string>               exprs;
+	std::promise<std::vector<std::string>> result;
 };
 
 static std::queue<std::shared_ptr<TloQuery>> s_tloQueue;
 static std::mutex                            s_tloMutex;
+
+// Guards against one request monopolising a frame; MQ's parser is not free and
+// OnPulse blocks rendering.
+static constexpr size_t k_maxTloBatch = 64;
 
 //============================================================================
 // Chat ring buffer — fed by OnWriteChatColor, read by HTTP thread
@@ -835,6 +843,25 @@ static json HandleMCP(const json& req)
 					{"properties", {{"expr", {{"type","string"},{"description","TLO expression, with or without surrounding ${}"}}}}},
 					{"required",   {"expr"}}
 				}}
+			},
+			{
+				{"name",        "query_tlo_batch"},
+				{"description", "Evaluate several TLO expressions at once, all on the SAME game frame. "
+				                "Prefer this over repeated query_tlo calls: each single call costs a network "
+				                "round trip plus a game pulse, and values read from different frames can "
+				                "disagree (position vs target vs distance). Same syntax and 'resolved' "
+				                "semantics as query_tlo, one result object per expression in request order. "
+				                "Example: [\"Me.Y\",\"Me.X\",\"Target.CleanName\",\"Target.Distance\"]. "
+				                "Limit 64 expressions per call."},
+				{"inputSchema", {
+					{"type",       "object"},
+					{"properties", {{"exprs", {
+						{"type","array"},
+						{"items", {{"type","string"}}},
+						{"description","TLO expressions, each with or without surrounding ${}"}
+					}}}},
+					{"required",   {"exprs"}}
+				}}
 			}
 		}}});
 	}
@@ -892,21 +919,28 @@ static json HandleMCP(const json& req)
 			return respondWithState("Said: " + text);
 		}
 
-		if (tool == "query_tlo")
-		{
-			std::string expr = args.value("expr", "");
-			if (expr.empty())
-				return MakeError(id, -32602, "expr is required");
+		// Accept a bare TLO for convenience; wrap it so the parser sees a macro
+		// expression. Anything already containing ${ passes through untouched,
+		// which is what allows composite strings like "${Me.Name} ${Me.Level}".
+		auto wrapExpr = [](const std::string& e) {
+			return (e.find("${") == std::string::npos) ? "${" + e + "}" : e;
+		};
 
-			// Accept a bare TLO for convenience; wrap it so the parser sees a
-			// macro expression. Anything already containing ${ is passed through,
-			// which also allows composite strings.
-			const std::string parsed = (expr.find("${") == std::string::npos)
-				? "${" + expr + "}"
-				: expr;
+		// MQ reports a failed lookup either as the literal "NULL" or by leaving the
+		// expression untouched. Surfacing that beats returning "NULL" as if it were
+		// a real value -- a caller checking a boolean TLO would otherwise read a
+		// non-empty string and conclude true.
+		auto isResolved = [](const std::string& value, const std::string& expr) {
+			return value != "NULL" && value != expr;
+		};
 
-			auto q  = std::make_shared<TloQuery>();
-			q->expr = parsed;
+		// Submit expressions to the game thread and wait for one frame's worth of
+		// answers. Returns false and fills 'err' on timeout or abandonment.
+		auto evaluateOnGameThread = [&](const std::vector<std::string>& exprs,
+		                                std::vector<std::string>& out,
+		                                std::string& err) -> bool {
+			auto q   = std::make_shared<TloQuery>();
+			q->exprs = exprs;
 			auto fut = q->result.get_future();
 			{
 				std::lock_guard lock(s_tloMutex);
@@ -914,27 +948,77 @@ static json HandleMCP(const json& req)
 			}
 
 			// The game thread fulfills this on the next pulse (~100ms). A timeout
-			// here means pulses are not running: client at char select, frozen, or
-			// shutting down. Far better to say so than to block the HTTP thread.
+			// means pulses are not running: char select, frozen client, or shutdown.
+			// Far better to say so than to block the HTTP thread indefinitely.
 			if (fut.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
-				return MakeError(id, -32000,
-					"Timed out waiting for the game thread to evaluate: " + parsed);
+			{
+				err = "Timed out waiting for the game thread (is the client pulsing?)";
+				return false;
+			}
+			try { out = fut.get(); }
+			catch (...) { err = "TLO evaluation was abandoned (plugin unloading?)"; return false; }
+			return true;
+		};
 
-			std::string value;
-			try { value = fut.get(); }
-			catch (...) { return MakeError(id, -32000, "TLO evaluation was abandoned (plugin unloading?)"); }
+		if (tool == "query_tlo")
+		{
+			const std::string expr = args.value("expr", "");
+			if (expr.empty())
+				return MakeError(id, -32602, "expr is required");
 
-			// MQ reports a failed lookup either as the literal "NULL" or by leaving
-			// the expression untouched. Surfacing this beats returning "NULL" as if
-			// it were a real value -- a caller checking a boolean TLO would read a
-			// non-empty string and conclude true.
-			const bool resolved = (value != "NULL") && (value != parsed);
+			const std::string parsed = wrapExpr(expr);
+			std::vector<std::string> values;
+			std::string err;
+			if (!evaluateOnGameThread({parsed}, values, err) || values.empty())
+				return MakeError(id, -32000, err.empty() ? "No result returned" : err);
 
 			json out = {
 				{"expr",     parsed},
-				{"value",    value},
-				{"resolved", resolved}
+				{"value",    values[0]},
+				{"resolved", isResolved(values[0], parsed)}
 			};
+			return MakeOk(id, {{"content", {{{"type","text"},{"text", out.dump(2)}}}}});
+		}
+
+		if (tool == "query_tlo_batch")
+		{
+			if (!args.contains("exprs") || !args["exprs"].is_array())
+				return MakeError(id, -32602, "exprs must be an array of strings");
+
+			std::vector<std::string> raw, wrapped;
+			for (const auto& e : args["exprs"])
+			{
+				if (!e.is_string())
+					return MakeError(id, -32602, "every entry in exprs must be a string");
+				raw.push_back(e.get<std::string>());
+				wrapped.push_back(wrapExpr(raw.back()));
+			}
+
+			if (raw.empty())
+				return MakeError(id, -32602, "exprs must not be empty");
+			if (raw.size() > k_maxTloBatch)
+				return MakeError(id, -32602,
+					fmt::format("too many expressions ({}); the limit is {} per call",
+					            raw.size(), k_maxTloBatch));
+
+			std::vector<std::string> values;
+			std::string err;
+			if (!evaluateOnGameThread(wrapped, values, err))
+				return MakeError(id, -32000, err);
+			if (values.size() != wrapped.size())
+				return MakeError(id, -32000, "Result count did not match request count");
+
+			json results = json::array();
+			for (size_t i = 0; i < values.size(); ++i)
+			{
+				results.push_back({
+					{"expr",     raw[i]},
+					{"value",    values[i]},
+					{"resolved", isResolved(values[i], wrapped[i])}
+				});
+			}
+
+			json out = {{"count", results.size()}, {"results", results}};
 			return MakeOk(id, {{"content", {{{"type","text"},{"text", out.dump(2)}}}}});
 		}
 
@@ -1199,17 +1283,24 @@ PLUGIN_API void OnPulse()
 		auto q = std::move(tloToRun.front());
 		tloToRun.pop();
 
-		char buffer[MAX_STRING] = { 0 };
-		strncpy_s(buffer, q->expr.c_str(), sizeof(buffer) - 1);
+		std::vector<std::string> values;
+		values.reserve(q->exprs.size());
 
 		// Parser version 2 to match what MQ's own Lua binding uses, so results
-		// agree with what a script would see (see lua_MQBindings.cpp).
+		// agree with what a script would see (see lua_MQBindings.cpp). Swapped
+		// once around the whole batch rather than per expression.
 		auto oldParser = std::exchange(gParserVersion, 2);
-		ParseMacroData(buffer, sizeof(buffer));
+		for (const std::string& expr : q->exprs)
+		{
+			char buffer[MAX_STRING] = { 0 };
+			strncpy_s(buffer, expr.c_str(), sizeof(buffer) - 1);
+			ParseMacroData(buffer, sizeof(buffer));
+			values.emplace_back(buffer);
+		}
 		gParserVersion = oldParser;
 
 		// set_value throws if the promise was already satisfied or the future
 		// was abandoned; a throw escaping OnPulse would take the client down.
-		try { q->result.set_value(buffer); } catch (...) {}
+		try { q->result.set_value(std::move(values)); } catch (...) {}
 	}
 }
