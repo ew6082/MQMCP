@@ -38,6 +38,7 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <future>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -68,6 +69,27 @@ static void EnqueueCommand(std::string cmd)
 	std::lock_guard lock(s_queueMutex);
 	s_commandQueue.push(std::move(cmd));
 }
+
+//============================================================================
+// TLO query queue — HTTP thread -> game thread -> HTTP thread (synchronous)
+//
+// Unlike commands, a TLO query has to hand a value *back*, so this cannot be
+// fire-and-forget. The HTTP thread pushes a request holding a promise and then
+// blocks on its future; OnPulse evaluates on the game thread (the only place
+// touching MQ's parser is safe) and fulfills it.
+//
+// ParseMacroData must not be called from the HTTP thread: it walks live client
+// structures that the game thread mutates every frame.
+//============================================================================
+
+struct TloQuery
+{
+	std::string               expr;
+	std::promise<std::string> result;
+};
+
+static std::queue<std::shared_ptr<TloQuery>> s_tloQueue;
+static std::mutex                            s_tloMutex;
 
 //============================================================================
 // Chat ring buffer — fed by OnWriteChatColor, read by HTTP thread
@@ -797,6 +819,22 @@ static json HandleMCP(const json& req)
 					{"properties", {{"text", {{"type","string"},{"description","Text to say"}}}}},
 					{"required",   {"text"}}
 				}}
+			},
+			{
+				{"name",        "query_tlo"},
+				{"description", "Evaluate a MacroQuest TLO expression and return its value as a string. "
+				                "Accepts either a bare expression (Me.Name, Navigation.Setting[OpenDoors]) "
+				                "or a full macro string with ${} (e.g. \"${Me.Name} is level ${Me.Level}\"). "
+				                "Unlike get_state this reads live via MQ's parser, so it works even when the "
+				                "state snapshot is disabled. Note TLO index syntax uses [brackets], not (parens): "
+				                "Navigation.Setting[OpenDoors], not Navigation.Setting(OpenDoors). "
+				                "Returns JSON with the value and a 'resolved' flag that is false when the TLO "
+				                "did not evaluate (MQ yields NULL or echoes the expression back)."},
+				{"inputSchema", {
+					{"type",       "object"},
+					{"properties", {{"expr", {{"type","string"},{"description","TLO expression, with or without surrounding ${}"}}}}},
+					{"required",   {"expr"}}
+				}}
 			}
 		}}});
 	}
@@ -852,6 +890,52 @@ static json HandleMCP(const json& req)
 				return MakeError(id, -32602, "text is required");
 			EnqueueCommand("/say " + text);
 			return respondWithState("Said: " + text);
+		}
+
+		if (tool == "query_tlo")
+		{
+			std::string expr = args.value("expr", "");
+			if (expr.empty())
+				return MakeError(id, -32602, "expr is required");
+
+			// Accept a bare TLO for convenience; wrap it so the parser sees a
+			// macro expression. Anything already containing ${ is passed through,
+			// which also allows composite strings.
+			const std::string parsed = (expr.find("${") == std::string::npos)
+				? "${" + expr + "}"
+				: expr;
+
+			auto q  = std::make_shared<TloQuery>();
+			q->expr = parsed;
+			auto fut = q->result.get_future();
+			{
+				std::lock_guard lock(s_tloMutex);
+				s_tloQueue.push(q);
+			}
+
+			// The game thread fulfills this on the next pulse (~100ms). A timeout
+			// here means pulses are not running: client at char select, frozen, or
+			// shutting down. Far better to say so than to block the HTTP thread.
+			if (fut.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
+				return MakeError(id, -32000,
+					"Timed out waiting for the game thread to evaluate: " + parsed);
+
+			std::string value;
+			try { value = fut.get(); }
+			catch (...) { return MakeError(id, -32000, "TLO evaluation was abandoned (plugin unloading?)"); }
+
+			// MQ reports a failed lookup either as the literal "NULL" or by leaving
+			// the expression untouched. Surfacing this beats returning "NULL" as if
+			// it were a real value -- a caller checking a boolean TLO would read a
+			// non-empty string and conclude true.
+			const bool resolved = (value != "NULL") && (value != parsed);
+
+			json out = {
+				{"expr",     parsed},
+				{"value",    value},
+				{"resolved", resolved}
+			};
+			return MakeOk(id, {{"content", {{{"type","text"},{"text", out.dump(2)}}}}});
 		}
 
 		return MakeError(id, -32601, "Unknown tool: " + tool);
@@ -1100,5 +1184,32 @@ PLUGIN_API void OnPulse()
 	{
 		DoCommand(toRun.front().c_str(), false);
 		toRun.pop();
+	}
+
+	// Drain TLO queries. Same thread-safety reasoning as the commands above:
+	// ParseMacroData reads live client state, so it only runs here.
+	std::queue<std::shared_ptr<TloQuery>> tloToRun;
+	{
+		std::lock_guard lock(s_tloMutex);
+		std::swap(tloToRun, s_tloQueue);
+	}
+
+	while (!tloToRun.empty())
+	{
+		auto q = std::move(tloToRun.front());
+		tloToRun.pop();
+
+		char buffer[MAX_STRING] = { 0 };
+		strncpy_s(buffer, q->expr.c_str(), sizeof(buffer) - 1);
+
+		// Parser version 2 to match what MQ's own Lua binding uses, so results
+		// agree with what a script would see (see lua_MQBindings.cpp).
+		auto oldParser = std::exchange(gParserVersion, 2);
+		ParseMacroData(buffer, sizeof(buffer));
+		gParserVersion = oldParser;
+
+		// set_value throws if the promise was already satisfied or the future
+		// was abandoned; a throw escaping OnPulse would take the client down.
+		try { q->result.set_value(buffer); } catch (...) {}
 	}
 }
