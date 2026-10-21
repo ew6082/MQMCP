@@ -2,10 +2,11 @@
  * MQMCPServer - Model Context Protocol server for MacroQuest
  *
  * Exposes EverQuest game state as MCP resources and accepts tool calls
- * to control the character. Runs an HTTP server on localhost:8284.
+ * to control the character. Runs an HTTP server on localhost, one port per client:
+ * the character's pinned port (/mcp port <n>), else the first free one from 8284.
  *
- * MCP endpoint:  POST http://localhost:8284/mcp  (JSON-RPC 2.0)
- * Debug REST:    GET  http://localhost:8284/me|zone|target|spawns
+ * MCP endpoint:  POST http://localhost:<port>/mcp  (JSON-RPC 2.0)
+ * Debug REST:    GET  http://localhost:<port>/me|zone|target|spawns
  */
 
 // cpp-httplib requires a Windows 10 API level (CreateFile2, etc.), but MQ's
@@ -53,8 +54,13 @@ PLUGIN_VERSION(1.0);
 
 using json = nlohmann::json;
 
+// Every boxed client loads this plugin, so each needs its own port. A client takes its
+// pinned port from [Ports] <CharName>=<port> in the plugin ini when it has one (set with
+// /mcp port <n>), otherwise the first free port in k_defaultPort..+k_portSpan-1.
 static constexpr int k_defaultPort = 8284;
-static int s_port = k_defaultPort;
+static constexpr int k_portSpan    = 32;
+static std::atomic<int>  s_port{0};          // 0 = not listening
+static std::atomic<bool> s_stopping{false};  // tells long-lived handlers (SSE) to bail
 static std::chrono::steady_clock::time_point s_startTime;
 
 //============================================================================
@@ -1095,14 +1101,17 @@ static void SetupRoutes()
 			"text/event-stream",
 			[](size_t /*offset*/, httplib::DataSink& sink) {
 				// Send a keepalive comment every 15 seconds.
-				// The loop exits when the client disconnects (sink.is_writable() == false).
+				// The loop exits when the client disconnects (sink.is_writable() == false)
+				// or the server is stopping. The 15s wait is sliced so a stop -- which joins
+				// this worker from the game thread -- is not held up by a sleeping stream.
 				const std::string keepalive = ": keepalive\n\n";
 				for (;;)
 				{
-					if (!sink.is_writable())
+					if (s_stopping || !sink.is_writable())
 						return false;
 					sink.write(keepalive.data(), keepalive.size());
-					std::this_thread::sleep_for(std::chrono::seconds(15));
+					for (int i = 0; i < 60 && !s_stopping; ++i)
+						std::this_thread::sleep_for(std::chrono::milliseconds(250));
 				}
 			}
 		);
@@ -1114,7 +1123,7 @@ static void SetupRoutes()
 	s_server->Get("/.well-known/oauth-protected-resource", [](const httplib::Request&, httplib::Response& res) {
 		AddCors(res);
 		// No auth required — return minimal valid metadata
-		res.set_content(json{{"resource", fmt::format("http://127.0.0.1:{}", s_port)}}.dump(), "application/json");
+		res.set_content(json{{"resource", fmt::format("http://127.0.0.1:{}", s_port.load())}}.dump(), "application/json");
 	});
 
 	s_server->Get("/.well-known/oauth-authorization-server", [](const httplib::Request&, httplib::Response& res) {
@@ -1145,11 +1154,174 @@ static void SetupRoutes()
 }
 
 //============================================================================
+// Server lifecycle / port selection
+//============================================================================
+
+// httplib 0.15.3's default_socket_options sets SO_REUSEADDR and *then*
+// SO_EXCLUSIVEADDRUSE on Windows. Winsock rejects that combination (WSAEINVAL on the
+// second call, unchecked), leaving a plain REUSEADDR socket -- so every boxed client
+// bound 8284 and the newest silently took over connections. Exclusive only, so a port
+// already in use fails to bind and we move on to the next.
+static void ExclusiveSocketOptions(socket_t sock)
+{
+	int yes = 1;
+	setsockopt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&yes), sizeof(yes));
+}
+
+static std::atomic<bool> s_listenDone{true};
+
+static void StopServer()
+{
+	if (!s_server)
+		return;
+
+	s_stopping = true;
+	s_server->stop();
+
+	// Workers blocked in a TLO wait need OnPulse to answer them, but we are usually
+	// *on* the game thread here (OnPulse, /mcp, ShutdownPlugin), so they would sit out
+	// their 5s timeout and stall the client. Dropping the queued promises breaks them
+	// immediately instead; keep doing it until the listener has drained its workers,
+	// since a keep-alive connection can still enqueue between our sweeps.
+	while (!s_listenDone)
+	{
+		{
+			std::lock_guard lock(s_tloMutex);
+			std::queue<std::shared_ptr<TloQuery>>().swap(s_tloQueue);
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+
+	if (s_serverThread)
+	{
+		if (s_serverThread->joinable())
+			s_serverThread->join();
+		delete s_serverThread;
+		s_serverThread = nullptr;
+	}
+	s_server.reset();
+	s_port = 0;
+}
+
+// Binds `preferred` if given and free, else the first free port in the scan range.
+// Returns the bound port, or 0 if nothing in the range was free.
+static int StartServer(int preferred)
+{
+	StopServer();
+
+	s_server = std::make_unique<httplib::Server>();
+	s_server->set_socket_options(ExclusiveSocketOptions);
+	SetupRoutes();
+
+	int port = 0;
+	if (preferred > 0 && s_server->bind_to_port("127.0.0.1", preferred))
+		port = preferred;
+	for (int p = k_defaultPort; !port && p < k_defaultPort + k_portSpan; ++p)
+		if (s_server->bind_to_port("127.0.0.1", p))
+			port = p;
+
+	if (!port)
+	{
+		s_server.reset();
+		return 0;
+	}
+
+	s_stopping   = false;
+	s_listenDone = false;
+	s_port       = port;
+	s_serverThread = new std::thread([] {
+		s_server->listen_after_bind();
+		s_listenDone = true;
+	});
+	// stop() is a no-op until the listener is running, so a stop racing a fresh start
+	// would leave join() waiting forever. Don't return until it is up.
+	s_server->wait_until_ready();
+	return port;
+}
+
+static std::string CurrentCharName()
+{
+	if (GetGameState() != GAMESTATE_INGAME || !pLocalPlayer)
+		return {};
+	return pLocalPlayer->Name;
+}
+
+static int PinnedPort(const std::string& name)
+{
+	if (name.empty())
+		return 0;
+	return ::GetPrivateProfileIntA("Ports", name.c_str(), 0, INIFileName);
+}
+
+static void SavePinnedPort(const std::string& name, int port)
+{
+	// port 0 deletes the key (back to auto)
+	::WritePrivateProfileStringA("Ports", name.c_str(),
+		port > 0 ? std::to_string(port).c_str() : nullptr, INIFileName);
+}
+
+static void AnnouncePort(int wanted)
+{
+	int port = s_port;
+	if (!port)
+		WriteChatf("\ag[MQMCPServer]\ax \arNo free port in %d-%d -- server not running.\ax",
+			k_defaultPort, k_defaultPort + k_portSpan - 1);
+	else if (wanted > 0 && port != wanted)
+		WriteChatf("\ag[MQMCPServer]\ax \arPinned port %d is in use\ax -- listening on \ayhttp://127.0.0.1:%d/mcp\ax instead", wanted, port);
+	else
+		WriteChatf("\ag[MQMCPServer]\ax MCP server listening on \ayhttp://127.0.0.1:%d/mcp\ax -- type \aw/mcp\ax for status", port);
+}
+
+// Move onto this character's pinned port, if it has one and we are not already on it.
+static void ApplyPinnedPort()
+{
+	int pin = PinnedPort(CurrentCharName());
+	if (pin <= 0 || pin == s_port)
+		return;
+	StartServer(pin);
+	AnnouncePort(pin);
+}
+
+//============================================================================
 // /mcp command — display server status
 //============================================================================
 
-static void Cmd_MCPStatus(PlayerClient* /*pChar*/, const char* /*szLine*/)
+static void Cmd_MCPStatus(PlayerClient* /*pChar*/, const char* szLine)
 {
+	// /mcp port <n>   pin this character to <n> and rebind now
+	// /mcp port auto  drop the pin and rebind to the first free port
+	char arg1[MAX_STRING] = { 0 };
+	char arg2[MAX_STRING] = { 0 };
+	GetArg(arg1, szLine, 1);
+	GetArg(arg2, szLine, 2);
+	if (ci_equals(arg1, "port"))
+	{
+		std::string name = CurrentCharName();
+		if (name.empty())
+		{
+			WriteChatf("\ag[MQMCPServer]\ax Ports are pinned per character -- log in first.");
+			return;
+		}
+		if (ci_equals(arg2, "auto"))
+		{
+			SavePinnedPort(name, 0);
+			StartServer(0);
+			AnnouncePort(0);
+			return;
+		}
+		int want = GetIntFromString(arg2, 0);
+		if (want < 1024 || want > 65535)
+		{
+			WriteChatf("\ag[MQMCPServer]\ax Usage: /mcp port <1024-65535|auto>   (now: %d)", s_port.load());
+			return;
+		}
+		SavePinnedPort(name, want);
+		if (want != s_port)
+			StartServer(want);
+		AnnouncePort(want);
+		return;
+	}
+
 	// Uptime
 	auto elapsed = std::chrono::steady_clock::now() - s_startTime;
 	int totalSec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
@@ -1190,7 +1362,9 @@ static void Cmd_MCPStatus(PlayerClient* /*pChar*/, const char* /*szLine*/)
 	}
 
 	WriteChatf("\ag[MQMCPServer]\ax ─────────────────────────────────");
-	WriteChatf("\ag[MQMCPServer]\ax  URL    : \ayhttp://127.0.0.1:%d/mcp\ax", s_port);
+	int pin = PinnedPort(CurrentCharName());
+	WriteChatf("\ag[MQMCPServer]\ax  URL    : \ayhttp://127.0.0.1:%d/mcp\ax  (%s)", s_port.load(),
+		pin > 0 ? fmt::format("pinned {}", pin).c_str() : "auto");
 	WriteChatf("\ag[MQMCPServer]\ax  Uptime : \aw%02d:%02d:%02d\ax", hours, minutes, secs);
 	WriteChatf("\ag[MQMCPServer]\ax  Game   : %s", inGame ? fmt::format("\aw{}\ax", charInfo).c_str() : "\arNot in game\ax");
 	WriteChatf("\ag[MQMCPServer]\ax  Queue  : \aw%d\ax pending command(s)", queueDepth);
@@ -1222,32 +1396,21 @@ PLUGIN_API void InitializePlugin()
 {
 	s_startTime = std::chrono::steady_clock::now();
 
-	s_server = std::make_unique<httplib::Server>();
-	SetupRoutes();
-
-	s_serverThread = new std::thread([] {
-		s_server->listen("127.0.0.1", s_port);
-	});
+	// Loaded in game: go straight to the pinned port. Loaded at char select: auto for
+	// now, and OnPulse moves us to the pin once the character is known.
+	int pin = PinnedPort(CurrentCharName());
+	StartServer(pin);
 
 	AddCommand("/mcp", Cmd_MCPStatus);
 
-	WriteChatf("\ag[MQMCPServer]\ax MCP server listening on \ayhttp://127.0.0.1:%d/mcp\ax — type \aw/mcp\ax for status", s_port);
+	AnnouncePort(pin);
 }
 
 PLUGIN_API void ShutdownPlugin()
 {
 	RemoveCommand("/mcp");
 
-	if (s_server)
-		s_server->stop();
-	if (s_serverThread)
-	{
-		if (s_serverThread->joinable())
-			s_serverThread->join();
-		delete s_serverThread;
-		s_serverThread = nullptr;
-	}
-	s_server.reset();
+	StopServer();
 
 	WriteChatf("\ag[MQMCPServer]\ax Stopped.");
 }
@@ -1302,5 +1465,17 @@ PLUGIN_API void OnPulse()
 		// set_value throws if the promise was already satisfied or the future
 		// was abandoned; a throw escaping OnPulse would take the client down.
 		try { q->result.set_value(std::move(values)); } catch (...) {}
+	}
+
+	// Apply the character's pinned port once per entry into the game. Polled here rather
+	// than in SetGameState because pLocalPlayer is not guaranteed to be set on the INGAME
+	// transition. Runs after the TLO drain so a rebind has no queries left to strand.
+	static bool s_pinChecked = false;
+	if (CurrentCharName().empty())
+		s_pinChecked = false;
+	else if (!s_pinChecked)
+	{
+		s_pinChecked = true;
+		ApplyPinnedPort();
 	}
 }
