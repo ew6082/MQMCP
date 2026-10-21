@@ -4,7 +4,7 @@ A MacroQuest plugin that exposes EverQuest game state and character control via 
 
 ## Overview
 
-MQMCPServer runs a local HTTP server on `localhost:8284`. It speaks JSON-RPC 2.0 over the `/mcp` endpoint, making it compatible with any MCP client or custom agent.
+MQMCPServer runs a local HTTP server on `localhost`, one port per EverQuest client: the character's pinned port if it has one, otherwise the first free port from `8284` (see [Ports](#ports)). It speaks JSON-RPC 2.0 over the `/mcp` endpoint, making it compatible with any MCP client or custom agent.
 
 Game state is read each server pulse (main thread) and cached for lock-free access by HTTP clients. Commands are queued from the HTTP thread and executed on the next pulse, keeping everything thread-safe and EQ-compatible.
 
@@ -21,7 +21,15 @@ Game state is read each server pulse (main thread) and cached for lock-free acce
 
 ## In-Game Command
 
-Type `/mcp` in EverQuest to display server status: URL, uptime, character info, pending command queue depth, and chat buffer count.
+Type `/mcp` in EverQuest to display server status: URL (with whether the port is pinned or auto), uptime, character info, pending command queue depth, and chat buffer count.
+
+| Command | Effect |
+|---------|--------|
+| `/mcp` | Show status |
+| `/mcp port <n>` | Pin this character to port `<n>` (1024–65535) and rebind now |
+| `/mcp port auto` | Remove this character's pin and rebind to the first free port |
+
+You have to be logged in to a character to use `/mcp port`, because pins are stored per character.
 
 ## MCP Tools
 
@@ -326,7 +334,7 @@ source and takes ~17 minutes; later ones are seconds.
 
 ## Usage with an MCP Client
 
-Add the server to your MCP client config:
+Add one server entry per character to your MCP client config, each pointing at that character's port:
 
 ```json
 {
@@ -334,10 +342,16 @@ Add the server to your MCP client config:
     "everquest": {
       "type": "http",
       "url": "http://127.0.0.1:8284/mcp"
+    },
+    "everquest-vtan": {
+      "type": "http",
+      "url": "http://127.0.0.1:8285/mcp"
     }
   }
 }
 ```
+
+Pin each character's port (`/mcp port <n>`) so the entries stay correct no matter which order the clients start in.
 
 All tools (`get_state`, `execute_command`, `navigate_to`, `say`) will be available to any connected MCP client.
 
@@ -359,7 +373,19 @@ python eq_agent.py "Kill gnolls; loot everything; meditate when low mana"
 
 ## Configuration
 
-The port defaults to `8284`. To change it, modify `k_defaultPort` in `MQMCPServer.cpp` and rebuild.
+### Ports
+
+Every boxed client loads its own copy of the plugin, so each one needs a different port.
+
+- **Pinned:** `/mcp port <n>` saves the pin in `MQMCPServer.ini` as `[Ports] <CharName>=<n>`. You can also edit that section by hand. If the pinned port is already taken, the server falls back to auto and says so in chat.
+- **Auto:** An unpinned client binds the first free port in `8284`–`8315`. The client that starts first gets the lowest port, so auto ports can change between sessions.
+- **Loaded at char select:** The character isn't known yet, so the server starts on auto. Once you enter the game, it moves to that character's pinned port.
+
+The scan range is set by `k_defaultPort` and `k_portSpan` in `MQMCPServer.cpp`.
+
+**Why the server binds with `SO_EXCLUSIVEADDRUSE` only:** cpp-httplib 0.15.3's default socket options set `SO_REUSEADDR` and then `SO_EXCLUSIVEADDRUSE` on Windows. Winsock rejects that combination. The second call fails, httplib doesn't check the result, and the socket is left as plain `SO_REUSEADDR`. As a result, every client successfully bound `8284`, and the newest one silently took over its connections. With exclusive-only binding, a port that is already in use fails to bind and the server moves on to the next one. Don't go back to httplib's defaults.
+
+`eq_agent.py` connects to `MCP_URL`, which is set near the top of the script to `http://127.0.0.1:8284`. Change it to drive a character on another port.
 
 ## Notes
 
