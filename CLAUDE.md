@@ -52,17 +52,48 @@ OnPulse, and unloading from within its own callback is unsafe.
   The rip `.mcp.json` (gitignored, local only) registers them as `everquest`,
   `everquest-vtan` and `everquest-davran`.
 
+## Security
+
+Requests with an `Origin` header get a 403, and no CORS headers are sent (pre-routing
+handler in `SetupRoutes`). Before this, `Access-Control-Allow-Origin: *` with no auth
+let any web page POST `execute_command` to 127.0.0.1. Don't add CORS back.
+
+## Snapshot
+
+The struct-reading snapshot (`get_state`, `eq://` resources, REST) is off by default.
+Turn it on with `/mcp snapshot on|off` (`[Settings] Snapshot` in the ini, shared by all
+clients). Confirmed working on 2026-10-27 against the `Oct 19 2026` MQ build, and on
+in the ini since then. After an EQ patch, if a client crashes when the plugin loads,
+set `Snapshot=0` first. Off, `get_state` returns only `inGame` + chat; use `query_tlo_batch`.
+
 ## To-do
 
-1. **Reading new chat is awkward.** `recent_chat` is a 4000-line ring buffer with no
-   sequence numbers, so "lines since my command" can't be found by length once a chatty
-   client (bards) has filled it; callers had to `/echo` a unique marker and search for
-   it. A `chat_since` tool (monotonic line ids, or "since marker") would fix that.
-2. **`get_state` is heavy** — it returns the full chat buffer every call, slow on chatty
-   clients. Consider a `max_chat` argument, or dropping chat from get_state in favour of (1).
-3. **Port discovery** — no way to list which character is on which port without probing
-   8284–8315. Options: write a `[Clients]` table to a shared ini on bind, or a
-   `GET /whoami` that returns name/server cheaply (`/me` returns zeros at char select).
+In order of payoff:
+
+1. **Chat sequence numbers + `chat_since(seq, filter?)`.** `recent_chat` is a 4000-line
+   ring buffer with no ids, so "lines since my command" can't be found by length once a
+   chatty client (bards) has filled it; callers `/echo` a unique marker and search for it.
+   Give each line a monotonic id. (2) and (3) build on this.
+2. **`run_command` that returns its output.** It would run on the next pulse, wait a short
+   window (~500ms default, settable), and return the chat lines produced meanwhile.
+   `execute_command` is fire-and-forget, and its state reply is captured *before* the
+   command runs.
+3. **`wait_for(expr, timeout)`.** It would check a TLO condition every pulse on the game
+   thread and return as soon as it's true (`Me.Casting.ID==0`, `Navigation.Active==FALSE`).
+   That replaces client-side poll loops, which cost a round trip per check and sample a
+   different frame each time.
+4. **Port discovery.** There's no way to list which character is on which port without
+   probing 8284–8315. Write a `[Clients]` table to the shared ini on bind and/or add
+   `GET /whoami` (name/server, cheap; `/me` returns zeros at char select). A
+   `query_peer(name, expr)` could then remove the DanNet `/dex` + tell workaround.
+5. **Slimmer `get_state`.** It still returns the full chat buffer (action tools now send
+   only the last 20 lines). Make chat opt-in (`max_chat`), or add `include: [...]`.
+6. **Build `get_state` from TLOs** (one `query_tlo_batch`-style evaluation) instead of
+   struct reads, so an EQ patch can't crash it and the snapshot toggle can go.
+7. **`navigate_to` by spawn/target** (`/nav id`, `/nav target`), optionally waiting until
+   nav ends (via `wait_for`).
+8. **Protocol version.** It reports `2024-11-05`. Moving to Streamable HTTP would let the
+   SSE keepalive stub go. Not urgent while Claude Code accepts it.
 
 ## Gotchas learned using it
 

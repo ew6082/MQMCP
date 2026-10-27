@@ -28,6 +28,9 @@ Type `/mcp` in EverQuest to display server status: URL (with whether the port is
 | `/mcp` | Show status |
 | `/mcp port <n>` | Pin this character to port `<n>` (1024–65535) and rebind now |
 | `/mcp port auto` | Remove this character's pin and rebind to the first free port |
+| `/mcp snapshot on\|off` | Enable or disable the state snapshot (saved in `MQMCP.ini` as `[Settings] Snapshot`) |
+
+The state snapshot behind `get_state`, the `eq://` resources and the debug REST endpoints is **off by default**. It reads EverQuest structs directly, and those reads crash the client when eqlib's struct offsets fall behind an EQ patch. While it's off, those return almost no game data, but `execute_command`, `query_tlo`, `query_tlo_batch` and chat still work.
 
 You have to be logged in to a character to use `/mcp port`, because pins are stored per character.
 
@@ -47,7 +50,7 @@ Executes any MacroQuest or EverQuest slash command on the next game pulse.
 |-----------|------|-------------|
 | `command` | string | Full command including leading slash, e.g. `/cast 1`, `/attack on` |
 
-Commands are queued and executed in order on the next EQ pulse. The response includes a state snapshot captured before the command runs — call `get_state` again to observe the result.
+Commands are queued and executed in order on the next EQ pulse. The response includes a state snapshot captured before the command runs, with only the last 20 chat lines. Call `get_state` again to observe the result.
 
 ---
 
@@ -150,7 +153,7 @@ The `get_state` tool (and the inline state returned with each command) returns:
 | `abilities` | Known combat abilities/disciplines with ready status and `secs_remaining` until ready (seconds, not ms) |
 | `active_buffs` | Self buffs and songs with remaining duration in ticks (`-1` = permanent, `-4` = song/disc) |
 | `loot_available` | Items in the AdvLoot window (personal and shared) |
-| `recent_chat` | Last 100 lines of game chat (combat, spells, system, say, group, etc.) |
+| `recent_chat` | Buffered game chat, up to 4000 lines (combat, spells, system, say, group, etc.). Action tools include only the last 20. |
 
 ## MCP Resources
 
@@ -168,7 +171,7 @@ In addition to tools, the server exposes MCP resources for granular reads:
 | `eq://buffs` | Active buffs and songs on self |
 | `eq://loot` | Items currently in the AdvLoot window |
 | `eq://group` | Group members with HP%, mana%, level, and role |
-| `eq://chat` | Last 100 lines of buffered chat |
+| `eq://chat` | Buffered chat, up to 4000 lines |
 
 ## Chat Capture
 
@@ -391,6 +394,7 @@ The scan range is set by `k_defaultPort` and `k_portSpan` in `MQMCP.cpp`.
 ## Notes
 
 - Commands are executed on the EQ main thread (game pulse) — never from the HTTP thread
+- Requests that carry an `Origin` header are refused with 403, and no CORS headers are sent. Browsers add that header and MCP clients don't, so a web page can't drive the client through `127.0.0.1`.
 - State snapshots update every pulse (~100ms)
 - Nearby spawns are capped at 60, sorted by distance, within 300 units
 - MQ2Nav must be loaded for `navigate_to` to work

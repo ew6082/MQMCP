@@ -109,7 +109,8 @@ static constexpr size_t k_maxTloBatch = 64;
 // Chat ring buffer — fed by OnWriteChatColor, read by HTTP thread
 //============================================================================
 
-static constexpr size_t k_chatBufferSize = 4000;
+static constexpr size_t k_chatBufferSize  = 4000;
+static constexpr size_t k_actionChatLines = 20;   // chat tail sent back with action tools
 static std::deque<std::string> s_chatLines;
 static std::mutex              s_chatMutex;
 
@@ -192,9 +193,10 @@ struct GameSnapshot
 
 	// Memorized spells (gem slots 0-based)
 	struct SpellGem {
-		int         gem     = 0;
-		int         spellId = -1;
+		int         gem         = 0;
+		int         spellId     = -1;
 		std::string name;
+		uint32_t    msRemaining = 0;   // recast timer; read here so the HTTP thread never does
 	};
 	std::vector<SpellGem> memSpells;
 
@@ -236,8 +238,9 @@ struct GameSnapshot
 
 static GameSnapshot s_snapshot;
 static std::mutex   s_snapshotMutex;
-// OFF during eqlib struct-layout fixes (snapshot reads PlayerClient/spawn fields that
-// may be at wrong offsets and crash). Server still serves execute_command + chat.
+// OFF by default: the snapshot reads PlayerClient/spawn fields directly, which crash
+// when eqlib's struct offsets lag an EQ patch. The server still serves execute_command,
+// query_tlo and chat. /mcp snapshot on|off toggles it ([Settings] Snapshot in the ini).
 static bool         s_snapshotEnabled = false;
 
 static const char* SpawnTypeName(int type)
@@ -253,11 +256,7 @@ static const char* SpawnTypeName(int type)
 
 static void UpdateSnapshot()
 {
-	// The snapshot reads PlayerClient/spawn fields via the eqlib structs. During an
-	// eqlib struct-layout update those offsets can be wrong, making these reads crash.
-	// While the layout is being fixed, keep this OFF so the server still runs for
-	// execute_command + chat capture (which don't touch the structs). Toggle with
-	// /mcpsnapshot, or flip this default back to true once the structs are correct.
+	// Struct field reads below are skipped unless s_snapshotEnabled (see its comment).
 	GameSnapshot snap;
 	// GetGameState()/pLocalPlayer-null are safe (not struct field reads), so always set
 	// inGame accurately — the command queue, chat reader and resources gate on it.
@@ -375,8 +374,9 @@ static void UpdateSnapshot()
 				continue;
 
 			GameSnapshot::SpellGem sg;
-			sg.gem     = gem;
-			sg.spellId = spellId;
+			sg.gem         = gem;
+			sg.spellId     = spellId;
+			sg.msRemaining = GetSpellGemTimer(gem);
 
 			if (EQ_Spell* pSpell = GetSpellByID(spellId))
 				sg.name = pSpell->Name;
@@ -555,8 +555,9 @@ static json BuildTargetJson(const GameSnapshot& s)
 }
 
 // Compact state summary returned alongside every tool response so the LLM
-// always has situational awareness after acting.
-static json BuildStateJson(const GameSnapshot& s)
+// always has situational awareness after acting. maxChat caps recent_chat to the
+// newest lines: action responses must not drag the whole 4000-line buffer along.
+static json BuildStateJson(const GameSnapshot& s, size_t maxChat = k_chatBufferSize)
 {
 	if (!s.inGame)
 		return {{"inGame", false}};
@@ -570,22 +571,20 @@ static json BuildStateJson(const GameSnapshot& s)
 	for (const GameSnapshot::XTargetEntry& xt : s.xTargets)
 		xtargets.push_back({{"name", xt.name}, {"level", xt.level}, {"distance", xt.distance}});
 
-	// Recent chat (all buffered lines, up to k_chatBufferSize)
+	// Recent chat (the newest maxChat buffered lines)
 	json chat = json::array();
 	{
 		std::lock_guard chatLock(s_chatMutex);
-		for (const std::string& line : s_chatLines)
-			chat.push_back(line);
+		size_t skip = s_chatLines.size() > maxChat ? s_chatLines.size() - maxChat : 0;
+		for (auto it = s_chatLines.begin() + skip; it != s_chatLines.end(); ++it)
+			chat.push_back(*it);
 	}
 
 	// Memorized spells + recast readiness
 	json spells = json::array();
 	for (const GameSnapshot::SpellGem& sg : s.memSpells)
-	{
-		uint32_t msRemaining = GetSpellGemTimer(sg.gem);
 		spells.push_back({{"gem", sg.gem}, {"name", sg.name}, {"id", sg.spellId},
-		                  {"ready", msRemaining == 0}, {"ms_remaining", msRemaining}});
-	}
+		                  {"ready", sg.msRemaining == 0}, {"ms_remaining", sg.msRemaining}});
 
 	// Loot available
 	json loot = json::array();
@@ -693,7 +692,7 @@ static json HandleMCP(const json& req)
 			{{"uri","eq://target"}, {"name","Current Target"},  {"description","Your currently selected target"},          {"mimeType","application/json"}},
 			{{"uri","eq://spawns"}, {"name","Nearby Spawns"},   {"description","All spawns within 300 units"},             {"mimeType","application/json"}},
 			{{"uri","eq://spells"}, {"name","Memorized Spells"},{"description","Spells currently memorized in gem slots"},    {"mimeType","application/json"}},
-			{{"uri","eq://chat"},   {"name","Recent Chat"},     {"description","Last 100 lines of chat and MQ output"},      {"mimeType","application/json"}},
+			{{"uri","eq://chat"},   {"name","Recent Chat"},     {"description","Buffered chat and MQ output (up to 4000 lines)"},    {"mimeType","application/json"}},
 			{{"uri","eq://loot"},   {"name","Available Loot"},  {"description","Items currently in the AdvLoot window"},          {"mimeType","application/json"}},
 			{{"uri","eq://group"},     {"name","Group Members"},   {"description","Current group members with HP, level, and role"},             {"mimeType","application/json"}},
 			{{"uri","eq://buffs"},     {"name","Active Buffs"},    {"description","Buffs and songs currently active on your character"},         {"mimeType","application/json"}},
@@ -774,16 +773,13 @@ static json HandleMCP(const json& req)
 		{
 			json arr = json::array();
 			for (const GameSnapshot::SpellGem& sg : s_snapshot.memSpells)
-			{
-				uint32_t msRemaining = GetSpellGemTimer(sg.gem);
 				arr.push_back({
 					{"gem",          sg.gem},
 					{"name",         sg.name},
 					{"id",           sg.spellId},
-					{"ready",        msRemaining == 0},
-					{"ms_remaining", msRemaining}
+					{"ready",        sg.msRemaining == 0},
+					{"ms_remaining", sg.msRemaining}
 				});
-			}
 			content = arr;
 		}
 		else return MakeError(id, -32602, "Unknown resource URI: " + uri);
@@ -877,10 +873,11 @@ static json HandleMCP(const json& req)
 		const std::string tool = req.value("/params/name"_json_pointer, "");
 		const json        args = req.value("/params/arguments"_json_pointer, json::object());
 
-		// Helper: build a response that includes current game state
+		// Helper: build a response that includes current game state. The command has
+		// only been queued, so its own output is not in chat yet; a short tail is enough.
 		auto respondWithState = [&](std::string msg) {
 			std::lock_guard lock(s_snapshotMutex);
-			json state = BuildStateJson(s_snapshot);
+			json state = BuildStateJson(s_snapshot, k_actionChatLines);
 			std::string text = msg + "\n\nCurrent state:\n" + state.dump(2);
 			return MakeOk(id, {{"content", {{{"type","text"},{"text", std::move(text)}}}}});
 		};
@@ -1046,26 +1043,24 @@ static std::unique_ptr<httplib::Server> s_server;
 // the real exit. A raw pointer has a trivial destructor, so teardown can never abort.
 static std::thread*                      s_serverThread = nullptr;
 
-static void AddCors(httplib::Response& res)
-{
-	res.set_header("Access-Control-Allow-Origin",  "*");
-	res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-	res.set_header("Access-Control-Allow-Headers", "Content-Type, Accept");
-}
-
 static void SetupRoutes()
 {
-	// CORS preflight
-	s_server->Options(".*", [](const httplib::Request&, httplib::Response& res) {
-		AddCors(res);
-		res.status = 204;
+	// Browsers attach Origin to cross-site requests; MCP clients (Claude Code, Python
+	// scripts) do not. Refusing anything with an Origin stops a web page -- or a DNS
+	// rebinding attack -- from driving the client through 127.0.0.1. No CORS headers
+	// are sent either, so browsers also block preflighted requests on their own.
+	s_server->set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res) {
+		if (!req.has_header("Origin"))
+			return httplib::Server::HandlerResponse::Unhandled;
+		res.status = 403;
+		res.set_content(R"({"error":"browser requests are not allowed"})", "application/json");
+		return httplib::Server::HandlerResponse::Handled;
 	});
 
 	// -----------------------------------------------------------------------
 	// MCP endpoint — POST for JSON-RPC requests
 	// -----------------------------------------------------------------------
 	s_server->Post("/mcp", [](const httplib::Request& req, httplib::Response& res) {
-		AddCors(res);
 		try
 		{
 			json body     = json::parse(req.body);
@@ -1093,7 +1088,6 @@ static void SetupRoutes()
 	// it alive with periodic comments. Claude Code requires this to exist.
 	// -----------------------------------------------------------------------
 	s_server->Get("/mcp", [](const httplib::Request&, httplib::Response& res) {
-		AddCors(res);
 		res.set_header("Cache-Control",  "no-cache");
 		res.set_header("X-Accel-Buffering", "no");
 
@@ -1121,13 +1115,11 @@ static void SetupRoutes()
 	// OAuth discovery — return empty metadata so Claude Code skips OAuth
 	// -----------------------------------------------------------------------
 	s_server->Get("/.well-known/oauth-protected-resource", [](const httplib::Request&, httplib::Response& res) {
-		AddCors(res);
 		// No auth required — return minimal valid metadata
 		res.set_content(json{{"resource", fmt::format("http://127.0.0.1:{}", s_port.load())}}.dump(), "application/json");
 	});
 
 	s_server->Get("/.well-known/oauth-authorization-server", [](const httplib::Request&, httplib::Response& res) {
-		AddCors(res);
 		res.status = 404;
 		res.set_content(R"({"error":"not_found"})", "application/json");
 	});
@@ -1136,7 +1128,6 @@ static void SetupRoutes()
 	// Convenience read-only REST endpoints (useful for debugging)
 	// -----------------------------------------------------------------------
 	auto gameGet = [](httplib::Response& res, auto buildFn) {
-		AddCors(res);
 		std::lock_guard lock(s_snapshotMutex);
 		if (!s_snapshot.inGame)
 		{
@@ -1294,6 +1285,19 @@ static void Cmd_MCPStatus(PlayerClient* /*pChar*/, const char* szLine)
 	char arg2[MAX_STRING] = { 0 };
 	GetArg(arg1, szLine, 1);
 	GetArg(arg2, szLine, 2);
+
+	// /mcp snapshot on|off   enable the struct-reading state snapshot (saved in the ini)
+	if (ci_equals(arg1, "snapshot"))
+	{
+		if (ci_equals(arg2, "on") || ci_equals(arg2, "off"))
+		{
+			s_snapshotEnabled = ci_equals(arg2, "on");
+			::WritePrivateProfileStringA("Settings", "Snapshot", s_snapshotEnabled ? "1" : "0", INIFileName);
+		}
+		WriteChatf("\ag[MQMCP]\ax Snapshot is \ay%s\ax   (/mcp snapshot on|off)", s_snapshotEnabled ? "on" : "off");
+		return;
+	}
+
 	if (ci_equals(arg1, "port"))
 	{
 		std::string name = CurrentCharName();
@@ -1366,6 +1370,7 @@ static void Cmd_MCPStatus(PlayerClient* /*pChar*/, const char* szLine)
 	WriteChatf("\ag[MQMCP]\ax  URL    : \ayhttp://127.0.0.1:%d/mcp\ax  (%s)", s_port.load(),
 		pin > 0 ? fmt::format("pinned {}", pin).c_str() : "auto");
 	WriteChatf("\ag[MQMCP]\ax  Uptime : \aw%02d:%02d:%02d\ax", hours, minutes, secs);
+	WriteChatf("\ag[MQMCP]\ax  Snap   : \aw%s\ax  (/mcp snapshot on|off)", s_snapshotEnabled ? "on" : "off");
 	WriteChatf("\ag[MQMCP]\ax  Game   : %s", inGame ? fmt::format("\aw{}\ax", charInfo).c_str() : "\arNot in game\ax");
 	WriteChatf("\ag[MQMCP]\ax  Queue  : \aw%d\ax pending command(s)", queueDepth);
 	WriteChatf("\ag[MQMCP]\ax  Chat   : \aw%d\ax / %d lines buffered", chatDepth, (int)k_chatBufferSize);
@@ -1395,6 +1400,7 @@ PLUGIN_API BOOL OnIncomingChat(const char* Line, DWORD Color)
 PLUGIN_API void InitializePlugin()
 {
 	s_startTime = std::chrono::steady_clock::now();
+	s_snapshotEnabled = ::GetPrivateProfileIntA("Settings", "Snapshot", 0, INIFileName) != 0;
 
 	// Loaded in game: go straight to the pinned port. Loaded at char select: auto for
 	// now, and OnPulse moves us to the pin once the character is known.
