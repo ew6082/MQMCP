@@ -50,7 +50,7 @@ Executes any MacroQuest or EverQuest slash command on the next game pulse.
 |-----------|------|-------------|
 | `command` | string | Full command including leading slash, e.g. `/cast 1`, `/attack on` |
 
-Commands are queued and executed in order on the next EQ pulse. The response includes a state snapshot captured before the command runs, with only the last 20 chat lines. Call `get_state` again to observe the result.
+Commands are queued and executed in order on the next EQ pulse. The response includes a state snapshot captured before the command runs, with only the last 20 chat lines. Its `chat_seq` is taken before the command was queued, so `chat_since` with that value returns the command's output. To get the output in one call, use `run_command`.
 
 ---
 
@@ -73,6 +73,52 @@ Says text in local `/say` chat (visible to nearby players).
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `text` | string | Text to say |
+
+---
+
+### `run_command`
+Runs a slash command and returns the chat output that follows it.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `command` | string | Full command including leading slash |
+| `wait_ms` | integer | How long to keep collecting output after the command runs, 0–10000 (default 500) |
+| `filter` | string | Only return lines containing this text (case-insensitive) |
+| `max_lines` | integer | Cap on lines returned (default 200) |
+
+The tool waits until the command has run on the game thread, which takes up to 5 s before it gives up. It then waits `wait_ms` longer so that replies from the server, such as spell landed or resisted messages, can arrive. It returns every chat line since the command was queued, in the same format as `chat_since`. Lines from other sources that arrived in that window, such as combat spam, are included too, so use `filter` to narrow them.
+
+---
+
+### `chat_since`
+Returns chat lines newer than a sequence number, oldest first.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `since` | integer | Return lines with `seq` greater than this (default 0 = everything buffered) |
+| `filter` | string | Only lines containing this text (case-insensitive) |
+| `max_lines` | integer | Cap on lines returned (default 200) |
+
+Each line in the buffer has a sequence number that only increases. `get_state` reports the newest one as `chat_seq`. The result looks like this:
+
+```json
+{ "next": 1234, "more": false, "lines": [{ "seq": 1233, "text": "..." }, ...] }
+```
+
+Pass `next` as `since` on the next call. `next` moves past filtered-out lines too, so polling with a filter never rescans them. When `more` is `true`, `max_lines` was reached, so call again with `next`. `missed` (present only when non-zero) counts lines that were evicted from the 4000-line buffer before you read them. `reset: true` means the plugin was reloaded and numbering restarted from 1.
+
+---
+
+### `wait_for`
+Waits until a TLO expression becomes true. It checks the expression on every game pulse and returns as soon as the condition is met, or when the timeout runs out.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `expr` | string | TLO expression, with or without `${}` |
+| `equals` | string | Wait for this exact value (case-insensitive) instead of a truthy one |
+| `timeout_ms` | integer | Give up after this long, 0–60000 (default 5000) |
+
+When `equals` is not given, the condition is true if the value is `TRUE` or a non-zero number. `NULL`, `FALSE`, `0` and unresolved expressions count as false. For example, `{"expr": "Navigation.Active", "equals": "FALSE"}` waits for nav to finish, and `{"expr": "Me.Casting", "equals": "NULL"}` waits for a cast to end. For comparisons, use a TLO that evaluates them: `"${Math.Calc[${Me.PctHPs} > 80]}"`. The result is `{expr, met, value, resolved, elapsed_ms, polls}`, and `met: false` means it timed out.
 
 ## State Fields
 
@@ -154,6 +200,7 @@ The `get_state` tool (and the inline state returned with each command) returns:
 | `active_buffs` | Self buffs and songs with remaining duration in ticks (`-1` = permanent, `-4` = song/disc) |
 | `loot_available` | Items in the AdvLoot window (personal and shared) |
 | `recent_chat` | Buffered game chat, up to 4000 lines (combat, spells, system, say, group, etc.). Action tools include only the last 20. |
+| `chat_seq` | Sequence number of the newest chat line, to pass to `chat_since`. In action tool responses, it is taken before the command was queued. |
 
 ## MCP Resources
 

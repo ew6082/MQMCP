@@ -68,34 +68,29 @@ set `Snapshot=0` first. Off, `get_state` returns only `inGame` + chat; use `quer
 
 ## To-do
 
-In order of payoff:
+In order of payoff. Chat sequence numbers, `chat_since`, `run_command` and `wait_for` are
+done (2026-10-27). Once they're confirmed on a live client, update the rip scripts to use
+them instead of `/echo` markers and client-side poll loops.
 
-1. **Chat sequence numbers + `chat_since(seq, filter?)`.** `recent_chat` is a 4000-line
-   ring buffer with no ids, so "lines since my command" can't be found by length once a
-   chatty client (bards) has filled it; callers `/echo` a unique marker and search for it.
-   Give each line a monotonic id. (2) and (3) build on this.
-2. **`run_command` that returns its output.** It would run on the next pulse, wait a short
-   window (~500ms default, settable), and return the chat lines produced meanwhile.
-   `execute_command` is fire-and-forget, and its state reply is captured *before* the
-   command runs.
-3. **`wait_for(expr, timeout)`.** It would check a TLO condition every pulse on the game
-   thread and return as soon as it's true (`Me.Casting.ID==0`, `Navigation.Active==FALSE`).
-   That replaces client-side poll loops, which cost a round trip per check and sample a
-   different frame each time.
-4. **Port discovery.** There's no way to list which character is on which port without
+1. **Port discovery.** There's no way to list which character is on which port without
    probing 8284–8315. Write a `[Clients]` table to the shared ini on bind and/or add
    `GET /whoami` (name/server, cheap; `/me` returns zeros at char select). A
    `query_peer(name, expr)` could then remove the DanNet `/dex` + tell workaround.
-5. **Slimmer `get_state`.** It still returns the full chat buffer (action tools now send
-   only the last 20 lines). Make chat opt-in (`max_chat`), or add `include: [...]`.
-6. **Build `get_state` from TLOs** (one `query_tlo_batch`-style evaluation) instead of
+2. **Slimmer `get_state`.** It still returns the full chat buffer (action tools now send
+   only the last 20 lines). With `chat_since` available, chat could go from get_state
+   entirely (keep `chat_seq`), or become opt-in (`max_chat`).
+3. **Build `get_state` from TLOs** (one `query_tlo_batch`-style evaluation) instead of
    struct reads, so an EQ patch can't crash it and the snapshot toggle can go.
-7. **`navigate_to` by spawn/target** (`/nav id`, `/nav target`), optionally waiting until
+4. **`navigate_to` by spawn/target** (`/nav id`, `/nav target`), optionally waiting until
    nav ends (via `wait_for`).
-8. **Protocol version.** It reports `2024-11-05`. Moving to Streamable HTTP would let the
+5. **Protocol version.** It reports `2024-11-05`. Moving to Streamable HTTP would let the
    SSE keepalive stub go. Not urgent while Claude Code accepts it.
 
 ## Gotchas learned using it
+
+- `run_command` / `wait_for` block an httplib worker (pool of max(8, cores-1); each SSE
+  stream holds one permanently). Fine for a few concurrent callers. Long waits are why every wait
+  checks `s_stopping`: StopServer joins workers from the game thread, where no pulse runs.
 
 - TLO index syntax uses `[brackets]`; nested brackets inside `DanNet[x].Q[...]` do not
   resolve (`Me.Gem[1].Name` came back NULL). `DanNet.Q` also only returns values already

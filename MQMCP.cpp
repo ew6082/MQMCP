@@ -67,13 +67,21 @@ static std::chrono::steady_clock::time_point s_startTime;
 // Thread-safe command queue — written by HTTP thread, drained on game pulse
 //============================================================================
 
-static std::queue<std::string> s_commandQueue;
-static std::mutex              s_queueMutex;
+// 'done' is set by run_command, which has to know when its command actually ran so it can
+// collect the output that followed; fire-and-forget callers leave it null.
+struct QueuedCommand
+{
+	std::string                          cmd;
+	std::shared_ptr<std::promise<void>>  done;
+};
 
-static void EnqueueCommand(std::string cmd)
+static std::queue<QueuedCommand> s_commandQueue;
+static std::mutex                s_queueMutex;
+
+static void EnqueueCommand(std::string cmd, std::shared_ptr<std::promise<void>> done = nullptr)
 {
 	std::lock_guard lock(s_queueMutex);
-	s_commandQueue.push(std::move(cmd));
+	s_commandQueue.push({std::move(cmd), std::move(done)});
 }
 
 //============================================================================
@@ -111,8 +119,19 @@ static constexpr size_t k_maxTloBatch = 64;
 
 static constexpr size_t k_chatBufferSize  = 4000;
 static constexpr size_t k_actionChatLines = 20;   // chat tail sent back with action tools
-static std::deque<std::string> s_chatLines;
-static std::mutex              s_chatMutex;
+
+// Every line gets a monotonic sequence number so a caller can ask for "everything after
+// seq N" (chat_since, run_command) instead of guessing from the buffer length, which stops
+// working once a chatty client has filled the ring. Numbering restarts at 1 on plugin load.
+struct ChatLine
+{
+	uint64_t    seq;
+	std::string text;
+};
+
+static std::deque<ChatLine> s_chatLines;
+static uint64_t             s_chatLastSeq = 0;   // seq of the newest line; guarded by s_chatMutex
+static std::mutex           s_chatMutex;
 
 static void PushChatLine(const char* line)
 {
@@ -128,9 +147,58 @@ static void PushChatLine(const char* line)
 	}
 
 	std::lock_guard lock(s_chatMutex);
-	s_chatLines.push_back(std::move(clean));
+	s_chatLines.push_back({++s_chatLastSeq, std::move(clean)});
 	if (s_chatLines.size() > k_chatBufferSize)
 		s_chatLines.pop_front();
+}
+
+static uint64_t ChatLastSeq()
+{
+	std::lock_guard lock(s_chatMutex);
+	return s_chatLastSeq;
+}
+
+// Lines with seq > since, oldest first, at most maxLines, optionally only those containing
+// filter (case-insensitive). 'next' is the cursor for the following call: it advances past
+// filtered-out lines too, so a caller polling with a filter doesn't rescan them.
+static json ChatSince(uint64_t since, const std::string& filter, size_t maxLines)
+{
+	std::lock_guard lock(s_chatMutex);
+
+	// A cursor ahead of the newest line means the plugin was reloaded and numbering restarted.
+	bool reset = since > s_chatLastSeq;
+	if (reset)
+		since = 0;
+
+	uint64_t oldest = s_chatLines.empty() ? s_chatLastSeq + 1 : s_chatLines.front().seq;
+	// Lines evicted before being read. since 0 means "whatever is buffered", so nothing is missed.
+	uint64_t missed = since > 0 && since + 1 < oldest ? oldest - since - 1 : 0;
+	size_t   start  = since >= oldest ? static_cast<size_t>(since - oldest + 1) : 0;
+
+	json     lines = json::array();
+	uint64_t next  = std::max(since, oldest - 1);
+	bool     more  = false;
+	for (size_t i = start; i < s_chatLines.size(); ++i)
+	{
+		const ChatLine& line = s_chatLines[i];
+		if (filter.empty() || ci_find_substr(line.text, filter) >= 0)
+		{
+			if (lines.size() == maxLines)
+			{
+				more = true;
+				break;
+			}
+			lines.push_back({{"seq", line.seq}, {"text", line.text}});
+		}
+		next = line.seq;
+	}
+
+	json out = {{"next", next}, {"more", more}, {"lines", std::move(lines)}};
+	if (missed)
+		out["missed"] = missed;
+	if (reset)
+		out["reset"] = true;
+	return out;
 }
 
 //============================================================================
@@ -572,12 +640,14 @@ static json BuildStateJson(const GameSnapshot& s, size_t maxChat = k_chatBufferS
 		xtargets.push_back({{"name", xt.name}, {"level", xt.level}, {"distance", xt.distance}});
 
 	// Recent chat (the newest maxChat buffered lines)
-	json chat = json::array();
+	json     chat = json::array();
+	uint64_t chatSeq;
 	{
 		std::lock_guard chatLock(s_chatMutex);
 		size_t skip = s_chatLines.size() > maxChat ? s_chatLines.size() - maxChat : 0;
 		for (auto it = s_chatLines.begin() + skip; it != s_chatLines.end(); ++it)
-			chat.push_back(*it);
+			chat.push_back(it->text);
+		chatSeq = s_chatLastSeq;
 	}
 
 	// Memorized spells + recast readiness
@@ -614,7 +684,8 @@ static json BuildStateJson(const GameSnapshot& s, size_t maxChat = k_chatBufferS
 		{"mem_spells",     spells},
 		{"active_buffs",   buffs},
 		{"loot_available", loot},
-		{"recent_chat",    chat}
+		{"recent_chat",    chat},
+		{"chat_seq",       chatSeq}   // pass to chat_since to read only what comes after
 	};
 
 	if (s.hasTarget)
@@ -724,8 +795,8 @@ static json HandleMCP(const json& req)
 		{
 			json arr = json::array();
 			std::lock_guard chatLock(s_chatMutex);
-			for (const std::string& line : s_chatLines)
-				arr.push_back(line);
+			for (const ChatLine& line : s_chatLines)
+				arr.push_back(line.text);
 			content = arr;
 		}
 		else if (uri == "eq://loot")
@@ -801,7 +872,9 @@ static json HandleMCP(const json& req)
 			},
 			{
 				{"name",        "execute_command"},
-				{"description", "Execute any MacroQuest slash command (e.g. /say hello, /cast \"Complete Heal\")"},
+				{"description", "Queue any MacroQuest slash command (e.g. /say hello, /cast \"Complete Heal\") and "
+				                "return at once, before it runs. To see its output use run_command, or pass the "
+				                "returned chat_seq to chat_since."},
 				{"inputSchema", {
 					{"type",       "object"},
 					{"properties", {{"command", {{"type","string"},{"description","The full command including the leading slash"}}}}},
@@ -864,6 +937,61 @@ static json HandleMCP(const json& req)
 					}}}},
 					{"required",   {"exprs"}}
 				}}
+			},
+			{
+				{"name",        "chat_since"},
+				{"description", "Return chat lines newer than a sequence number, oldest first. Every buffered "
+				                "line has a monotonic 'seq'; get_state reports the newest as 'chat_seq'. Pass "
+				                "the 'next' value from the previous call as 'since' to read only new lines. "
+				                "'missed' counts lines that were evicted from the 4000-line buffer before you "
+				                "read them; 'reset' means the plugin reloaded and numbering restarted. "
+				                "'more' means max_lines was hit: call again with 'next'."},
+				{"inputSchema", {
+					{"type",       "object"},
+					{"properties", {
+						{"since",     {{"type","integer"},{"description","Return lines with seq greater than this (default 0 = all buffered)"}}},
+						{"filter",    {{"type","string"}, {"description","Only lines containing this text (case-insensitive)"}}},
+						{"max_lines", {{"type","integer"},{"description","Cap on lines returned (default 200)"}}}
+					}}
+				}}
+			},
+			{
+				{"name",        "run_command"},
+				{"description", "Run a slash command and return the chat output that follows it. Waits until the "
+				                "command has run on the game thread, then for wait_ms more (default 500) so game "
+				                "replies such as spell results arrive, then returns every chat line since the "
+				                "command was queued (optionally filtered). Use this instead of execute_command "
+				                "whenever you need to see what the command did. Output includes 'next' for a "
+				                "follow-up chat_since."},
+				{"inputSchema", {
+					{"type",       "object"},
+					{"properties", {
+						{"command",   {{"type","string"}, {"description","The full command including the leading slash"}}},
+						{"wait_ms",   {{"type","integer"},{"description","Extra time to collect output after the command runs, 0-10000 (default 500)"}}},
+						{"filter",    {{"type","string"}, {"description","Only lines containing this text (case-insensitive)"}}},
+						{"max_lines", {{"type","integer"},{"description","Cap on lines returned (default 200)"}}}
+					}},
+					{"required",   {"command"}}
+				}}
+			},
+			{
+				{"name",        "wait_for"},
+				{"description", "Wait until a TLO expression becomes true, checking it on every game pulse, "
+				                "and return as soon as it does or when timeout_ms passes. Without 'equals', "
+				                "the condition is true when the value is TRUE or a non-zero number; NULL, FALSE, "
+				                "0 and unresolved count as false. With 'equals', it is true when the value equals "
+				                "that text (case-insensitive), e.g. expr Navigation.Active equals FALSE, or "
+				                "Me.Casting equals NULL. For comparisons use a TLO that evaluates them, e.g. "
+				                "\"${Math.Calc[${Me.PctHPs} > 80]}\". Returns met, the last value and elapsed_ms."},
+				{"inputSchema", {
+					{"type",       "object"},
+					{"properties", {
+						{"expr",       {{"type","string"}, {"description","TLO expression, with or without surrounding ${}"}}},
+						{"equals",     {{"type","string"}, {"description","Wait for this exact value instead of a truthy one"}}},
+						{"timeout_ms", {{"type","integer"},{"description","Give up after this long, 0-60000 (default 5000)"}}}
+					}},
+					{"required",   {"expr"}}
+				}}
 			}
 		}}});
 	}
@@ -875,9 +1003,12 @@ static json HandleMCP(const json& req)
 
 		// Helper: build a response that includes current game state. The command has
 		// only been queued, so its own output is not in chat yet; a short tail is enough.
-		auto respondWithState = [&](std::string msg) {
+		// chatSeq, taken *before* queueing, replaces the snapshot's: the pulse may run the
+		// command before the state is built, and its output must land after the cursor.
+		auto respondWithState = [&](std::string msg, uint64_t chatSeq) {
 			std::lock_guard lock(s_snapshotMutex);
 			json state = BuildStateJson(s_snapshot, k_actionChatLines);
+			state["chat_seq"] = chatSeq;
 			std::string text = msg + "\n\nCurrent state:\n" + state.dump(2);
 			return MakeOk(id, {{"content", {{{"type","text"},{"text", std::move(text)}}}}});
 		};
@@ -894,8 +1025,9 @@ static json HandleMCP(const json& req)
 			std::string cmd = args.value("command", "");
 			if (cmd.empty())
 				return MakeError(id, -32602, "command is required");
+			uint64_t seq = ChatLastSeq();
 			EnqueueCommand(cmd);
-			return respondWithState("Queued: " + cmd);
+			return respondWithState("Queued: " + cmd, seq);
 		}
 
 		if (tool == "navigate_to")
@@ -909,8 +1041,9 @@ static json HandleMCP(const json& req)
 			float x = args.contains("x") ? toFloat(args["x"]) : 0.f;
 			float z = args.contains("z") ? toFloat(args["z"]) : 0.f;
 			std::string cmd = fmt::format("/nav loc {:.2f} {:.2f} {:.2f}", y, x, z);
+			uint64_t seq = ChatLastSeq();
 			EnqueueCommand(cmd);
-			return respondWithState("Navigating: " + cmd);
+			return respondWithState("Navigating: " + cmd, seq);
 		}
 
 		if (tool == "say")
@@ -918,8 +1051,9 @@ static json HandleMCP(const json& req)
 			std::string text = args.value("text", "");
 			if (text.empty())
 				return MakeError(id, -32602, "text is required");
+			uint64_t seq = ChatLastSeq();
 			EnqueueCommand("/say " + text);
-			return respondWithState("Said: " + text);
+			return respondWithState("Said: " + text, seq);
 		}
 
 		// Accept a bare TLO for convenience; wrap it so the parser sees a macro
@@ -1022,6 +1156,120 @@ static json HandleMCP(const json& req)
 			}
 
 			json out = {{"count", results.size()}, {"results", results}};
+			return MakeOk(id, {{"content", {{{"type","text"},{"text", out.dump(2)}}}}});
+		}
+
+		// Integer argument that tolerates a numeric string and clamps to [lo, hi].
+		auto intArg = [&](const char* key, int64_t def, int64_t lo, int64_t hi) -> int64_t {
+			int64_t v = def;
+			if (args.contains(key))
+			{
+				const json& a = args[key];
+				if (a.is_number())      v = a.get<int64_t>();
+				else if (a.is_string()) { try { v = std::stoll(a.get<std::string>()); } catch (...) {} }
+			}
+			return std::clamp(v, lo, hi);
+		};
+
+		// Waits are sliced so a server stop -- which joins this worker from the game thread,
+		// where no pulse can run -- is never held up by a sleeping request.
+		auto sleepUnlessStopping = [](int64_t ms) {
+			auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+			while (!s_stopping && std::chrono::steady_clock::now() < until)
+				std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		};
+
+		if (tool == "chat_since")
+		{
+			uint64_t    since    = static_cast<uint64_t>(intArg("since", 0, 0, INT64_MAX));
+			size_t      maxLines = static_cast<size_t>(intArg("max_lines", 200, 1, k_chatBufferSize));
+			std::string filter   = args.value("filter", "");
+			json out = ChatSince(since, filter, maxLines);
+			return MakeOk(id, {{"content", {{{"type","text"},{"text", out.dump(2)}}}}});
+		}
+
+		if (tool == "run_command")
+		{
+			std::string cmd = args.value("command", "");
+			if (cmd.empty())
+				return MakeError(id, -32602, "command is required");
+			int64_t     waitMs   = intArg("wait_ms", 500, 0, 10000);
+			size_t      maxLines = static_cast<size_t>(intArg("max_lines", 200, 1, k_chatBufferSize));
+			std::string filter   = args.value("filter", "");
+
+			uint64_t since = ChatLastSeq();
+			auto     done  = std::make_shared<std::promise<void>>();
+			auto     fut   = done->get_future();
+			EnqueueCommand(cmd, done);
+
+			// Same 5s budget as a TLO query: a pulse that hasn't come by then isn't coming soon.
+			auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			while (fut.wait_for(std::chrono::milliseconds(20)) != std::future_status::ready)
+			{
+				if (s_stopping)
+					return MakeError(id, -32000, "Server stopping; the command may not have run");
+				if (std::chrono::steady_clock::now() >= deadline)
+					return MakeError(id, -32000, "Command not run within 5s (is the client pulsing?). "
+					                             "It is still queued and will run on the next pulse.");
+			}
+			sleepUnlessStopping(waitMs);
+
+			json out = ChatSince(since, filter, maxLines);
+			out["command"] = cmd;
+			return MakeOk(id, {{"content", {{{"type","text"},{"text", out.dump(2)}}}}});
+		}
+
+		if (tool == "wait_for")
+		{
+			const std::string expr = args.value("expr", "");
+			if (expr.empty())
+				return MakeError(id, -32602, "expr is required");
+			const bool        hasEquals = args.contains("equals") && args["equals"].is_string();
+			const std::string equals    = hasEquals ? args["equals"].get<std::string>() : "";
+			const int64_t     timeoutMs = intArg("timeout_ms", 5000, 0, 60000);
+			const std::string parsed    = wrapExpr(expr);
+
+			// MQ renders booleans as TRUE/FALSE and numbers as text ("0", "0.00").
+			auto isTruthy = [&](const std::string& v) {
+				if (!isResolved(v, parsed) || v.empty() || ci_equals(v, "FALSE"))
+					return false;
+				char* end = nullptr;
+				double d = std::strtod(v.c_str(), &end);
+				if (end != v.c_str() && *end == '\0')
+					return d != 0.0;
+				return true;
+			};
+
+			// Each evaluation waits for its own pulse, so this loop runs at the pulse rate.
+			auto        start = std::chrono::steady_clock::now();
+			std::string value;
+			bool        met   = false;
+			int         polls = 0;
+			for (;;)
+			{
+				std::vector<std::string> values;
+				std::string err;
+				if (!evaluateOnGameThread({parsed}, values, err) || values.empty())
+					return MakeError(id, -32000, err.empty() ? "No result returned" : err);
+				value = values[0];
+				++polls;
+				met = hasEquals ? ci_equals(value, equals) : isTruthy(value);
+
+				auto elapsed = std::chrono::steady_clock::now() - start;
+				if (met || s_stopping || elapsed >= std::chrono::milliseconds(timeoutMs))
+					break;
+			}
+
+			auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - start).count();
+			json out = {
+				{"expr",       parsed},
+				{"met",        met},
+				{"value",      value},
+				{"resolved",   isResolved(value, parsed)},
+				{"elapsed_ms", elapsedMs},
+				{"polls",      polls}
+			};
 			return MakeOk(id, {{"content", {{{"type","text"},{"text", out.dump(2)}}}}});
 		}
 
@@ -1427,7 +1675,7 @@ PLUGIN_API void OnPulse()
 	UpdateSnapshot();
 
 	// Drain and execute queued commands on the main thread
-	std::queue<std::string> toRun;
+	std::queue<QueuedCommand> toRun;
 	{
 		std::lock_guard lock(s_queueMutex);
 		std::swap(toRun, s_commandQueue);
@@ -1435,7 +1683,11 @@ PLUGIN_API void OnPulse()
 
 	while (!toRun.empty())
 	{
-		DoCommand(toRun.front().c_str(), false);
+		QueuedCommand& qc = toRun.front();
+		DoCommand(qc.cmd.c_str(), false);
+		// Output DoCommand writes synchronously is already in the chat buffer by now.
+		if (qc.done)
+			try { qc.done->set_value(); } catch (...) {}
 		toRun.pop();
 	}
 
