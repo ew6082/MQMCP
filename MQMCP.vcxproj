@@ -58,7 +58,7 @@
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="MQMCPServer.cpp" />
+    <ClCompile Include="MQMCP.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\main\MQ2Main.vcxproj">

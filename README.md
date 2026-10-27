@@ -1,10 +1,10 @@
-# MQMCPServer
+# MQMCP
 
 A MacroQuest plugin that exposes EverQuest game state and character control via the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP). Allows LLM agents and external tools to observe and control your character in real time.
 
 ## Overview
 
-MQMCPServer runs a local HTTP server on `localhost`, one port per EverQuest client: the character's pinned port if it has one, otherwise the first free port from `8284` (see [Ports](#ports)). It speaks JSON-RPC 2.0 over the `/mcp` endpoint, making it compatible with any MCP client or custom agent.
+MQMCP runs a local HTTP server on `localhost`, one port per EverQuest client: the character's pinned port if it has one, otherwise the first free port from `8284` (see [Ports](#ports)). It speaks JSON-RPC 2.0 over the `/mcp` endpoint, making it compatible with any MCP client or custom agent.
 
 Game state is read each server pulse (main thread) and cached for lock-free access by HTTP clients. Commands are queued from the HTTP thread and executed on the next pulse, keeping everything thread-safe and EQ-compatible.
 
@@ -172,7 +172,7 @@ In addition to tools, the server exposes MCP resources for granular reads:
 
 ## Chat Capture
 
-MQMCPServer captures chat from two sources:
+MQMCP captures chat from two sources:
 - **`OnWriteChatColor`** — MQ output window (plugin messages, MQ2 output)
 - **`OnIncomingChat`** — All game chat channels (combat hits, spell results, XP messages, say, group, etc.)
 
@@ -235,14 +235,14 @@ Add to your CMake plugin list and build with the `test` preset.
 
 | File | Change | Why |
 |------|--------|-----|
-| `vcpkg.json` | port `name` → `mq-mcp-server` | MQ's overlay generator derives the port name from the **directory** name (`PORT_LOWER` in `cmake/vcpkg_manifest.cmake`), while vcpkg reads it from the manifest's `name` field. When they disagree nothing provides the port and vcpkg falls through to the upstream baseline: `error: the baseline does not contain an entry for port mq-mcp-server`. |
+| `vcpkg.json` | port `name` → `mqmcp` | MQ's overlay generator derives the port name from the **directory** name (`PORT_LOWER` in `cmake/vcpkg_manifest.cmake`), while vcpkg reads it from the manifest's `name` field. When they disagree nothing provides the port and vcpkg falls through to the upstream baseline: `error: the baseline does not contain an entry for port mqmcp`. |
 | `CMakeLists.txt` | `../../Plugin.cmake` → `../../src/Plugin.cmake` | The upstream path is correct only at `src/plugins/<name>/`. From `plugins/<name>/` it needs the `src/` segment — the same include the vcxproj→CMake converter emits for the other `plugins/` dwellers (compare `plugins/MQ2EQBC/CMakeLists.txt`). |
 | `portfile.cmake` | added | Empty-package stub. MQ regenerates it when absent, but vcpkg convention is that `vcpkg.json` + `portfile.cmake` are both port *source*, so a fresh clone has a complete port definition. |
 
-`MQMCPServer.vcxproj` still carries an upstream-layout `ProjectReference` to
+`MQMCP.vcxproj` still carries an upstream-layout `ProjectReference` to
 `..\..\main\MQ2Main.vcxproj`, which resolves outside the repo from `plugins/`. It is
 unused when building through the generated `build/MacroQuest.sln` (CMake writes its own
-project), so it was left alone. Fix it if you ever want a standalone `MQMCPServer.sln`.
+project), so it was left alone. Fix it if you ever want a standalone `MQMCP.sln`.
 
 ### Prerequisites in the openvanilla tree (NOT in this repo)
 
@@ -289,43 +289,44 @@ These are the ones a pull will revert. Re-apply as needed.
    The same header also uses `std::string_view` without including it — still resolving
    transitively today, so expect the same failure there on a future toolset bump.
 
-### Linking MQ2Main itself (not needed for this plugin)
-
-Two further failures block a full `MQ2Main.dll` link. **Both are vcpkg port problems, not
-MQ code**, and neither has to be solved to build this plugin — see the workaround below.
-
-- **crashpad debug/release mixing.** `crashpadConfig.cmake` resolves its libraries with a
-  bare `find_library(_LIB ${LIB_NAME})` and no debug/release distinction. vcpkg keeps
-  `debug/lib` on the search path, so a Release link picks up `MTd_StaticDebug` objects:
-  `LNK2038: mismatch detected for 'RuntimeLibrary'` (and `_ITERATOR_DEBUG_LEVEL`), repeated
-  for every crashpad object.
-- **`LNK1104: cannot open file 'absl_base.lib'`.** Nothing in MQ source or the generated
-  vcxproj asks for abseil, and abseil is not installed; the reference most likely comes
-  from a `/DEFAULTLIB` directive baked into `libprotobuf.lib`. Note the installed protobuf
-  is 3.21.12 while older generated `.pb` files in this tree came from 6.33.4, so the
-  dependency set has shifted at some point.
+7. **`local_build_overrides.cmake`** *(untracked, repo root)*, passed with
+   `-DCMAKE_PROJECT_INCLUDE_BEFORE`. It runs at the start of `project()`, after the root
+   `CMakeLists.txt` writes `build/vcpkg-configuration.json` and before the vcpkg toolchain
+   reads it. It fixes three gaps in the CMake conversion without editing tracked files:
+   - **vcpkg baseline.** `cmake/vcpkg-configuration.json.in` pins `d612d36b` (mid-2024:
+     protobuf 3.21.12, old crashpad). Upstream `c6e344db` moved the tree to `81e3c888`
+     (protobuf 6.33.4 + abseil) but updated only the MSBuild path. The override rewrites
+     the generated config's baseline. Symptoms on the old baseline: `LNK1104: cannot open
+     file 'absl_base.lib'`, and crashpad debug libs in a Release link (`LNK2038: mismatch
+     detected for 'RuntimeLibrary'`).
+   - **imanim sources.** `src/imgui/imgui.vcxproj` compiles `imanim/*.cpp`, but
+     `src/imgui/CMakeLists.txt` doesn't. The override adds them to the `imgui` target.
+     Symptom: `LNK2019: unresolved external symbol ... iam_update_begin_frame` (12 of them).
+   - **vcpkg lib directory.** `ProtobufLibs.h` names abseil libs with bare
+     `#pragma comment(lib, ...)`, but nothing puts the vcpkg lib directory on MQ2Main's
+     search path. The override adds it. Symptom:
+     `LNK1104: cannot open file 'absl_cordz_sample_token.lib'`.
 
 ### Build
 
-```
-cmake --preset live -DMQ_BUILD_CUSTOM_PLUGINS=ON
-cmake --build build --config Release --target MQMCPServer
-```
-
-**Workaround if MQ2Main will not link.** This plugin only needs `MQ2Main.lib` — an import
-library, i.e. export names — not a freshly linked `MQ2Main.dll`. Given a previously built
-`MQ2Main.lib` (and `routing.lib`, `pluginapi.lib`, `eqlib.lib`, which do build), place the
-import lib at `build/lib/release/MQ2Main.lib` and build the plugin project alone:
+Configure once (the first run builds protobuf and abseil from source, which takes a while):
 
 ```
-MSBuild.exe build/plugins/mq-mcp-server/MQMCPServer.vcxproj \
-    -p:Configuration=Release -p:Platform=x64 -p:BuildProjectReferences=false
+cmake --preset live -DMQ_BUILD_CUSTOM_PLUGINS=ON \
+    -DMQ_CUSTOM_PLUGINS_FILE=C:/repos/openvanilla/custom_plugins_scope.cmake \
+    -DCMAKE_PROJECT_INCLUDE_BEFORE=C:/repos/openvanilla/local_build_overrides.cmake
 ```
 
-`BuildProjectReferences=false` is what skips the broken MQ2Main link. Output lands at
-`build/bin/release/plugins/MQMCPServer.dll`; copy it into your MQ install's `plugins/`.
-Be aware that a *failed* MQ2Main link deletes any existing `build/bin/release/MQ2Main.dll`,
-so keep a copy if you depend on that one.
+`custom_plugins_scope.cmake` (untracked) lists just the plugins to build, currently
+`MQ2MyButtons2` and `mqmcp`. Then build MQ2Main and both plugins in Release:
+
+```
+cmake --build build --config Release --target MQ2Main MQMCP MQ2MyButtons2
+```
+
+The output lands in `build/bin/release/` (MQ2Main) and `build/bin/release/plugins/`.
+`build/MacroQuest.sln` is generated, untracked, and can be opened in Visual Studio to
+build the same targets.
 
 The presets need CMake ≥ 3.30 (`"version": 9`). Visual Studio 2022 ships a new enough one
 at `Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe`; a mingw CMake on
@@ -357,7 +358,7 @@ All tools (`get_state`, `execute_command`, `navigate_to`, `say`) will be availab
 
 ## Usage with a Python Agent
 
-`eq_agent.py` is a standalone Python orchestrator that connects directly to MQMCPServer over HTTP and drives the character using an LLM agentic loop.
+`eq_agent.py` is a standalone Python orchestrator that connects directly to MQMCP over HTTP and drives the character using an LLM agentic loop.
 
 ```bash
 pip install anthropic httpx
@@ -377,11 +378,11 @@ python eq_agent.py "Kill gnolls; loot everything; meditate when low mana"
 
 Every boxed client loads its own copy of the plugin, so each one needs a different port.
 
-- **Pinned:** `/mcp port <n>` saves the pin in `MQMCPServer.ini` as `[Ports] <CharName>=<n>`. You can also edit that section by hand. If the pinned port is already taken, the server falls back to auto and says so in chat.
+- **Pinned:** `/mcp port <n>` saves the pin in `MQMCP.ini` as `[Ports] <CharName>=<n>`. You can also edit that section by hand. If the pinned port is already taken, the server falls back to auto and says so in chat.
 - **Auto:** An unpinned client binds the first free port in `8284`–`8315`. The client that starts first gets the lowest port, so auto ports can change between sessions.
 - **Loaded at char select:** The character isn't known yet, so the server starts on auto. Once you enter the game, it moves to that character's pinned port.
 
-The scan range is set by `k_defaultPort` and `k_portSpan` in `MQMCPServer.cpp`.
+The scan range is set by `k_defaultPort` and `k_portSpan` in `MQMCP.cpp`.
 
 **Why the server binds with `SO_EXCLUSIVEADDRUSE` only:** cpp-httplib 0.15.3's default socket options set `SO_REUSEADDR` and then `SO_EXCLUSIVEADDRUSE` on Windows. Winsock rejects that combination. The second call fails, httplib doesn't check the result, and the socket is left as plain `SO_REUSEADDR`. As a result, every client successfully bound `8284`, and the newest one silently took over its connections. With exclusive-only binding, a port that is already in use fails to bind and the server moves on to the next one. Don't go back to httplib's defaults.
 

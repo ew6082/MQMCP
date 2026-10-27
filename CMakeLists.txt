@@ -8,16 +8,16 @@ find_package(fmt REQUIRED)
 find_package(httplib REQUIRED)
 find_package(nlohmann_json REQUIRED)
 
-set(MQMCPServer_SOURCES "MQMCPServer.cpp")
-source_groups("Source Files" ${MQMCPServer_SOURCES})
+set(MQMCP_SOURCES "MQMCP.cpp")
+source_groups("Source Files" ${MQMCP_SOURCES})
 
-add_library(MQMCPServer SHARED ${MQMCPServer_SOURCES})
+add_library(MQMCP SHARED ${MQMCP_SOURCES})
 
-set_target_properties(MQMCPServer PROPERTIES FOLDER "plugins")
+set_target_properties(MQMCP PROPERTIES FOLDER "plugins")
 
-target_Plugin_props(MQMCPServer)
+target_Plugin_props(MQMCP)
 
-target_link_libraries(MQMCPServer PRIVATE
+target_link_libraries(MQMCP PRIVATE
     fmt::fmt
     httplib::httplib
     nlohmann_json::nlohmann_json

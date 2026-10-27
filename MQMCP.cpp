@@ -1,5 +1,5 @@
 /*
- * MQMCPServer - Model Context Protocol server for MacroQuest
+ * MQMCP - Model Context Protocol server for MacroQuest
  *
  * Exposes EverQuest game state as MCP resources and accepts tool calls
  * to control the character. Runs an HTTP server on localhost, one port per client:
@@ -49,7 +49,7 @@
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 
-PreSetup("MQMCPServer");
+PreSetup("MQMCP");
 PLUGIN_VERSION(1.0);
 
 using json = nlohmann::json;
@@ -681,7 +681,7 @@ static json HandleMCP(const json& req)
 		return MakeOk(id, {
 			{"protocolVersion", "2024-11-05"},
 			{"capabilities",    {{"resources", json::object()}, {"tools", json::object()}}},
-			{"serverInfo",      {{"name", "MQMCPServer"}, {"version", "1.0"}}}
+			{"serverInfo",      {{"name", "MQMCP"}, {"version", "1.0"}}}
 		});
 	}
 
@@ -1264,12 +1264,12 @@ static void AnnouncePort(int wanted)
 {
 	int port = s_port;
 	if (!port)
-		WriteChatf("\ag[MQMCPServer]\ax \arNo free port in %d-%d -- server not running.\ax",
+		WriteChatf("\ag[MQMCP]\ax \arNo free port in %d-%d -- server not running.\ax",
 			k_defaultPort, k_defaultPort + k_portSpan - 1);
 	else if (wanted > 0 && port != wanted)
-		WriteChatf("\ag[MQMCPServer]\ax \arPinned port %d is in use\ax -- listening on \ayhttp://127.0.0.1:%d/mcp\ax instead", wanted, port);
+		WriteChatf("\ag[MQMCP]\ax \arPinned port %d is in use\ax -- listening on \ayhttp://127.0.0.1:%d/mcp\ax instead", wanted, port);
 	else
-		WriteChatf("\ag[MQMCPServer]\ax MCP server listening on \ayhttp://127.0.0.1:%d/mcp\ax -- type \aw/mcp\ax for status", port);
+		WriteChatf("\ag[MQMCP]\ax MCP server listening on \ayhttp://127.0.0.1:%d/mcp\ax -- type \aw/mcp\ax for status", port);
 }
 
 // Move onto this character's pinned port, if it has one and we are not already on it.
@@ -1299,7 +1299,7 @@ static void Cmd_MCPStatus(PlayerClient* /*pChar*/, const char* szLine)
 		std::string name = CurrentCharName();
 		if (name.empty())
 		{
-			WriteChatf("\ag[MQMCPServer]\ax Ports are pinned per character -- log in first.");
+			WriteChatf("\ag[MQMCP]\ax Ports are pinned per character -- log in first.");
 			return;
 		}
 		if (ci_equals(arg2, "auto"))
@@ -1312,7 +1312,7 @@ static void Cmd_MCPStatus(PlayerClient* /*pChar*/, const char* szLine)
 		int want = GetIntFromString(arg2, 0);
 		if (want < 1024 || want > 65535)
 		{
-			WriteChatf("\ag[MQMCPServer]\ax Usage: /mcp port <1024-65535|auto>   (now: %d)", s_port.load());
+			WriteChatf("\ag[MQMCP]\ax Usage: /mcp port <1024-65535|auto>   (now: %d)", s_port.load());
 			return;
 		}
 		SavePinnedPort(name, want);
@@ -1361,15 +1361,15 @@ static void Cmd_MCPStatus(PlayerClient* /*pChar*/, const char* szLine)
 		}
 	}
 
-	WriteChatf("\ag[MQMCPServer]\ax ─────────────────────────────────");
+	WriteChatf("\ag[MQMCP]\ax ─────────────────────────────────");
 	int pin = PinnedPort(CurrentCharName());
-	WriteChatf("\ag[MQMCPServer]\ax  URL    : \ayhttp://127.0.0.1:%d/mcp\ax  (%s)", s_port.load(),
+	WriteChatf("\ag[MQMCP]\ax  URL    : \ayhttp://127.0.0.1:%d/mcp\ax  (%s)", s_port.load(),
 		pin > 0 ? fmt::format("pinned {}", pin).c_str() : "auto");
-	WriteChatf("\ag[MQMCPServer]\ax  Uptime : \aw%02d:%02d:%02d\ax", hours, minutes, secs);
-	WriteChatf("\ag[MQMCPServer]\ax  Game   : %s", inGame ? fmt::format("\aw{}\ax", charInfo).c_str() : "\arNot in game\ax");
-	WriteChatf("\ag[MQMCPServer]\ax  Queue  : \aw%d\ax pending command(s)", queueDepth);
-	WriteChatf("\ag[MQMCPServer]\ax  Chat   : \aw%d\ax / %d lines buffered", chatDepth, (int)k_chatBufferSize);
-	WriteChatf("\ag[MQMCPServer]\ax ─────────────────────────────────");
+	WriteChatf("\ag[MQMCP]\ax  Uptime : \aw%02d:%02d:%02d\ax", hours, minutes, secs);
+	WriteChatf("\ag[MQMCP]\ax  Game   : %s", inGame ? fmt::format("\aw{}\ax", charInfo).c_str() : "\arNot in game\ax");
+	WriteChatf("\ag[MQMCP]\ax  Queue  : \aw%d\ax pending command(s)", queueDepth);
+	WriteChatf("\ag[MQMCP]\ax  Chat   : \aw%d\ax / %d lines buffered", chatDepth, (int)k_chatBufferSize);
+	WriteChatf("\ag[MQMCP]\ax ─────────────────────────────────");
 }
 
 //============================================================================
@@ -1412,7 +1412,7 @@ PLUGIN_API void ShutdownPlugin()
 
 	StopServer();
 
-	WriteChatf("\ag[MQMCPServer]\ax Stopped.");
+	WriteChatf("\ag[MQMCP]\ax Stopped.");
 }
 
 PLUGIN_API void OnPulse()

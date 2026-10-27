@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 EverQuest autonomous agent orchestrator.
-Uses the Claude API + MQMCPServer to keep your character active.
+Uses the Claude API + MQMCP to keep your character active.
 
 Usage:
     python eq_agent.py "Kill gnolls for XP, loot everything"
@@ -523,7 +523,7 @@ def run(goal_str: str):
 
     open_log(goals[0])
     log(f"Goals: {goals}")
-    log(f"Connecting to MQMCPServer at {MCP_URL}...")
+    log(f"Connecting to MQMCP at {MCP_URL}...")
 
     # Seed with initial state and goal stack
     initial_state = get_current_state()
@@ -624,7 +624,7 @@ def run(goal_str: str):
                 log(f"API error: {e}. Retrying in 5s...")
                 time.sleep(5)
             except httpx.ConnectError:
-                log("Cannot reach MQMCPServer. Is EQ running with the plugin loaded? Retrying in 5s...")
+                log("Cannot reach MQMCP. Is EQ running with the plugin loaded? Retrying in 5s...")
                 time.sleep(5)
 
     except KeyboardInterrupt:
