@@ -392,15 +392,17 @@ Add one server entry per character to your MCP client config, each pointing at t
   "mcpServers": {
     "everquest": {
       "type": "http",
-      "url": "http://127.0.0.1:8284/mcp"
+      "url": "http://127.0.0.1:8280/mcp"
     },
     "everquest-vtan": {
       "type": "http",
-      "url": "http://127.0.0.1:8285/mcp"
+      "url": "http://127.0.0.1:8281/mcp"
     }
   }
 }
 ```
+
+Pin these ports below the auto range (8284–8315). Otherwise, an unpinned client that starts first can take a pinned character's port.
 
 Pin each character's port (`/mcp port <n>`) so the entries stay correct no matter which order the clients start in.
 

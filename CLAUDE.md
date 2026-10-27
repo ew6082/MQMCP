@@ -48,9 +48,9 @@ OnPulse, and unloading from within its own callback is unsafe.
 - Binding is `SO_EXCLUSIVEADDRUSE` only. httplib 0.15.3's default sets `SO_REUSEADDR`
   then `SO_EXCLUSIVEADDRUSE`, which Winsock rejects (unchecked), leaving a REUSEADDR
   socket — every client bound 8284 and the newest silently took over. Don't revert it.
-- Current pins: Terminaar 8280, Vtan 8285, Davran 8586. Terminaar and Davran are outside
-  the auto range on purpose; Vtan's is inside it, so an unpinned client started first can
-  take 8285 and push Vtan to auto.
+- Current pins: Terminaar 8280, Vtan 8281, Davran 8282 — all below the auto range on
+  purpose, so an unpinned client can never take a pinned character's port. Put new
+  pins at 8283 and below, not inside 8284–8315.
   The rip `.mcp.json` (gitignored, local only) registers them as `everquest`,
   `everquest-vtan` and `everquest-davran`.
 
