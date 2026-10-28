@@ -72,8 +72,9 @@ set `Snapshot=0` first. Off, `get_state` returns only `inGame` + chat; use `quer
 ## To-do
 
 In order of payoff. Chat sequence numbers, `chat_since`, `run_command` and `wait_for` are
-done (2026-10-27). Once they're confirmed on a live client, update the rip scripts to use
-them instead of `/echo` markers and client-side poll loops.
+done and confirmed live (2026-10-27). The rip scripts keep their `/echo` markers: they
+also tell the user what's happening in the MQ chat window. Read them from the MCP with
+`chat_since` (`tabs: ["MQ"]` + `filter`); any extra instrumentation for that is separate work.
 
 1. **Port discovery.** There's no way to list which character is on which port without
    probing 8284–8315. Write a `[Clients]` table to the shared ini on bind and/or add
