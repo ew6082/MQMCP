@@ -38,7 +38,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <algorithm>
+#include <array>
 #include <deque>
+#include <filesystem>
 #include <future>
 #include <mutex>
 #include <queue>
@@ -120,21 +123,427 @@ static constexpr size_t k_maxTloBatch = 64;
 static constexpr size_t k_chatBufferSize  = 4000;
 static constexpr size_t k_actionChatLines = 20;   // chat tail sent back with action tools
 
+//----------------------------------------------------------------------------
+// Chat channels and tabs
+//
+// OnIncomingChat hands us each line's color code (USERCOLOR_*), the same thing MQ2DPSAdv
+// switches on. EQ routes a line to a window by its *channel* (eChatChannel), and keeps the
+// channel -> window map plus window names in UI_<Name>_<server>.ini, [ChatManager]:
+// ChannelMap<channel>=<window>, ChatWindow<window>_Name=<tab name>. EQ's own color ->
+// channel lookup (CChatWindowManager::GetChannelFromColor) isn't exported by eqlib, so
+// ChannelFromColor below is a hand-made equivalent; the entries marked "guess" have no
+// one-to-one name match and should be checked against a live client.
+//
+// Reading the ini rather than CChatWindowManager::ChannelMap means a patch that moves the
+// struct can't crash us. The cost: EQ writes the ini when you camp, so a tab change made in
+// game shows up after the next login or /mcp chat reload.
+//----------------------------------------------------------------------------
+
+static constexpr int k_maxChatChannels = 128;   // eqlib knows 105; newer clients write ChannelMap up to 106
+static constexpr int k_channelMQ       = -2;    // MQ's own output (OnWriteChatColor), not an EQ channel
+static constexpr int k_channelUnknown  = -1;
+
+static int ChannelFromColor(int color)
+{
+	if (color >= USERCOLOR_CHAT_1 && color <= USERCOLOR_CHAT_10)
+		return CHAT_CHANNEL_CHAT1 + (color - USERCOLOR_CHAT_1);
+	if (color >= USERCOLOR_ECHO_CHAT_1 && color <= USERCOLOR_ECHO_CHAT_10)
+		return CHAT_CHANNEL_CHAT1 + (color - USERCOLOR_ECHO_CHAT_1);
+
+	switch (color)
+	{
+	case USERCOLOR_SAY:              case USERCOLOR_ECHO_SAY:     return CHAT_CHANNEL_SAY;
+	case USERCOLOR_TELL:             case USERCOLOR_ECHO_TELL:    return CHAT_CHANNEL_TELL;
+	case USERCOLOR_GROUP:            case USERCOLOR_ECHO_GROUP:   return CHAT_CHANNEL_GROUP;
+	case USERCOLOR_RAID:                                          return CHAT_CHANNEL_RAID;
+	case USERCOLOR_GUILD:            case USERCOLOR_ECHO_GUILD:
+	case USERCOLOR_GUILD_MSG:                                     return CHAT_CHANNEL_GUILD;
+	case USERCOLOR_OOC:              case USERCOLOR_ECHO_OOC:     return CHAT_CHANNEL_OOC;
+	case USERCOLOR_AUCTION:          case USERCOLOR_ECHO_AUCTION: return CHAT_CHANNEL_AUCTION;
+	case USERCOLOR_SHOUT:            case USERCOLOR_ECHO_SHOUT:   return CHAT_CHANNEL_SHOUT;
+	case USERCOLOR_EMOTE:            case USERCOLOR_ECHO_EMOTE:   return CHAT_CHANNEL_EMOTE;
+	case USERCOLOR_CHAT_CHANNEL:                                  return CHAT_CHANNEL_CHAT_CHANNEL_INFO;
+
+	case USERCOLOR_YOU_HIT_OTHER:          return CHAT_CHANNEL_MELEE_YOUR_HITS;
+	case USERCOLOR_YOU_MISS_OTHER:         return CHAT_CHANNEL_MELEE_YOUR_MISSES;
+	case USERCOLOR_OTHER_HIT_YOU:          return CHAT_CHANNEL_MELEE_YOU_BEING_HIT;
+	case USERCOLOR_OTHER_MISS_YOU:         return CHAT_CHANNEL_MELEE_YOU_BEING_MISSED;
+	case USERCOLOR_OTHER_HIT_OTHER:        return CHAT_CHANNEL_MELEE_OTHERS_HITS;
+	case USERCOLOR_OTHER_MISS_OTHER:       return CHAT_CHANNEL_MELEE_OTHERS_MISSES;
+	case USERCOLOR_YOUR_DEATH:             return CHAT_CHANNEL_MELEE_MY_DEATH;
+	case USERCOLOR_OTHER_DEATH:            return CHAT_CHANNEL_MELEE_OTHER_PC_DEATH;
+	case USERCOLOR_MELEE_CRIT:             return CHAT_CHANNEL_MELEE_CRITICAL_HITS;
+	case USERCOLOR_DISCIPLINES:            return CHAT_CHANNEL_MELEE_DISCIPLINES;
+	case USERCOLOR_TOO_FAR_AWAY:           return CHAT_CHANNEL_MELEE_WARNINGS;
+	case USERCOLOR_NPC_RAMPAGE:            return CHAT_CHANNEL_MELEE_NPC_RAMPAGE;
+	case USERCOLOR_NPC_FLURRY:             return CHAT_CHANNEL_MELEE_NPC_FLURRY;
+	case USERCOLOR_NPC_ENRAGE:             return CHAT_CHANNEL_MELEE_NPC_ENRAGE;
+	case USERCOLOR_FLURRY:                 return CHAT_CHANNEL_MELEE_YOUR_FLURRY;
+	case USERCOLOR_NPC_DEATH:              return CHAT_CHANNEL_MELEE_NPC_DEATH;
+	case USERCOLOR_MELEE_OTHERS_CRITICAL:  return CHAT_CHANNEL_MELEE_OTHERS_CRITICAL;
+	case USERCOLOR_DISCIPLINES_OTHER:      return CHAT_CHANNEL_OTHER_DISCIPLINES;
+	case USERCOLOR_TAUNT_MESSAGES:         return CHAT_CHANNEL_TAUNT_MESSAGES;
+
+	case USERCOLOR_SPELLS:                 return CHAT_CHANNEL_SPELLS_MINE;
+	case USERCOLOR_OTHERS_SPELLS:          return CHAT_CHANNEL_SPELLS_OTHERS;
+	case USERCOLOR_SPELL_FAILURE:          return CHAT_CHANNEL_SPELLS_FAILURES;
+	case USERCOLOR_SPELL_CRIT:             return CHAT_CHANNEL_SPELLS_CRITICALS;
+	case USERCOLOR_SPELL_WORN_OFF:         return CHAT_CHANNEL_SPELLS_WORN_OFF;
+	case USERCOLOR_NON_MELEE:              return CHAT_CHANNEL_SPELLS_DD_OTHERS;            // guess
+	case USERCOLOR_DIRECT_DAMAGE_YOU:      return CHAT_CHANNEL_SPELLS_DD_YOURS;
+	case USERCOLOR_DIRECT_DAMAGE_OTHERS:   return CHAT_CHANNEL_OTHER_DIRECT_DAMAGE;
+	case USERCOLOR_DIRECT_DAMAGE_OTHERS_CRITICAL: return CHAT_CHANNEL_SPELLS_DD_OTHERS_CRITICAL;
+	case USERCOLOR_DOTS_YOURS:             return CHAT_CHANNEL_YOUR_DOTS;
+	case USERCOLOR_DOTS_OTHERS:            return CHAT_CHANNEL_OTHER_DOTS;
+	case USERCOLOR_DOT_YOURS_CRITICAL:     return CHAT_CHANNEL_DOT_YOURS_CRITICAL;
+	case USERCOLOR_DOT_OTHERS_CRITICAL:    return CHAT_CHANNEL_DOT_OTHERS_CRITICAL;
+	case USERCOLOR_DOT_DAMAGE_TAKEN:       return CHAT_CHANNEL_DOT_YOU_BEING_HIT;
+	case USERCOLOR_HEALS_YOU:              return CHAT_CHANNEL_YOUR_HEALS;
+	case USERCOLOR_HEALS_OTHERS:           return CHAT_CHANNEL_OTHER_HEALS;
+	case USERCOLOR_HEALS_RECEIVED:         return CHAT_CHANNEL_HEALS_RECEIVED;
+	case USERCOLOR_HEALS_YOURS_CRITICAL:   return CHAT_CHANNEL_HEALS_YOUR_CRITICAL;
+	case USERCOLOR_HEALS_OTHERS_CRITICAL:  return CHAT_CHANNEL_HEALS_OTHERS_CRITICAL;
+	case USERCOLOR_AURAS_YOU:              return CHAT_CHANNEL_YOUR_AURAS;
+	case USERCOLOR_AURAS_OTHER:            return CHAT_CHANNEL_OTHER_AURAS;
+	case USERCOLOR_BARD_SONG_PETS:         return CHAT_CHANNEL_BARD_SONGS;                  // guess
+	case USERCOLOR_SPELL_MESSAGES:         return CHAT_CHANNEL_SPELL_EMOTES;
+	case USERCOLOR_FOCUS:                  return CHAT_CHANNEL_FOCUS_EFFECTS;
+	case USERCOLOR_OVERWRITTEN_DET:        return CHAT_CHANNEL_OVERWRITTEN_DETRIMENTAL_SPELL_MESSAGES;
+	case USERCOLOR_OVERWRITTEN_BENE:       return CHAT_CHANNEL_OVERWRITTEN_BENEFICIAL_SPELL_MESSAGES;
+	case USERCOLOR_SPELL_FAILURES_OTHER:   return NUM_CHAT_CHANNELS;                        // guess: first channel past eqlib's list
+	case USERCOLOR_LOCKED_INVENTORY_SLOTS: return NUM_CHAT_CHANNELS + 1;                    // guess
+
+	case USERCOLOR_PET:                    return CHAT_CHANNEL_PET_MESSAGES;                // guess
+	case USERCOLOR_PETRAMPFLURRY:          return CHAT_CHANNEL_PET_RAMPAGE_FLURRY;
+	case USERCOLOR_PETCRITS:               return CHAT_CHANNEL_PET_CRITICALS;
+	case USERCOLOR_PET_SPELLS:             return CHAT_CHANNEL_PET_SPELLS;
+	case USERCOLOR_PET_RESPONSES:          return CHAT_CHANNEL_PET_RESPONSES;
+	case USERCOLOR_DAMAGESHIELD:           return CHAT_CHANNEL_DAMAGE_SHIELDS_YOU_ATTACKING; // guess
+	case USERCOLOR_DAMAGESHIELD_SELF:      return CHAT_CHANNEL_DAMAGE_SHIELDS_YOU_DEFENDING; // guess
+	case USERCOLOR_DAMAGESHIELD_OTHER:     return CHAT_CHANNEL_DAMAGE_SHIELDS_OTHERS;
+	case USERCOLOR_FALL_DAMAGE_SELF:       return CHAT_CHANNEL_ENVIRONMENTAL_DAMAGE_YOURS;
+	case USERCOLOR_FALL_DAMAGE_OTHER:      return CHAT_CHANNEL_ENVIRONMENTAL_DAMAGE_OTHERS;
+
+	case USERCOLOR_SKILLS:                 return CHAT_CHANNEL_SKILLS;
+	case USERCOLOR_XP:                     return CHAT_CHANNEL_EXPERIENCE_MESSAGES;
+	case USERCOLOR_SYSTEM:                 return CHAT_CHANNEL_SYSTEM_MESSAGES;
+	case USERCOLOR_WHO:                    return CHAT_CHANNEL_WHO;
+	case USERCOLOR_EVENT:                  return CHAT_CHANNEL_EVENT_MESSAGES;
+	case USERCOLOR_NPC_SPEECH:
+	case USERCOLOR_NPC_SPEECH_TO_YOU:      return CHAT_CHANNEL_NPC_EMOTES;                  // guess
+	case USERCOLOR_ITEM_SPEECH:            return CHAT_CHANNEL_ITEM_SPEECH;
+	case USERCOLOR_FELLOWSHIP:             return CHAT_CHANNEL_FELLOWSHIP_MESSAGES;
+	case USERCOLOR_MERCENARY_GRP:          return CHAT_CHANNEL_MERCENARY_MESSAGES;
+	case USERCOLOR_PVP:                    return CHAT_CHANNEL_PVP_MESSAGES;
+	case USERCOLOR_DEBUG:                  return CHAT_CHANNEL_DEBUG;
+	case USERCOLOR_RANDOM:                 return CHAT_CHANNEL_RANDOM_YOUR_ROLLS;
+	case USERCOLOR_DICE_OTHER:             return CHAT_CHANNEL_RANDOM_OTHERS_ROLLS;
+	case USERCOLOR_DICE_GROUP:             return CHAT_CHANNEL_RANDOM_GROUP_RAID_ROLLS;
+	case USERCOLOR_LOOT:
+	case USERCOLOR_MONEY_SPLIT:            return CHAT_CHANNEL_LOOT_MESSAGES;               // guess for money
+	case USERCOLOR_FACTION:
+	case USERCOLOR_FACTION_LINK:           return CHAT_CHANNEL_FACTION_MESSAGES;
+	case USERCOLOR_CANT_USE_COMMAND:       return CHAT_CHANNEL_CANT_USE_COMMAND;
+	case USERCOLOR_ABILITY_COOLDOWN:       return CHAT_CHANNEL_COMBAT_ABILITY_REUSE;
+	case USERCOLOR_AA_REUSE_TIMER:         return CHAT_CHANNEL_AA_ABILITY_REUSE;
+	case USERCOLOR_DESTROY_ITEM:           return CHAT_CHANNEL_DESTROY_ITEM;
+	case USERCOLOR_ACHIEVEMENTS_YOU:       return CHAT_CHANNEL_YOUR_ACHIEVEMENTS;
+	case USERCOLOR_ACHIEVEMENTS_OTHERS:    return CHAT_CHANNEL_OTHER_ACHIEVEMENTS;
+	case USERCOLOR_FOOD_AND_DRINK:         return CHAT_CHANNEL_FOOD_AND_DRINK;
+	case USERCOLOR_RAID_VICTORY:           return CHAT_CHANNEL_RAID_VICTORY;
+
+	// Non-user colors (console/con colors) land in the colored "Other" channels.  guess
+	case CONCOLOR_GREEN:                   return CHAT_CHANNEL_OTHER_GREEN;
+	case CONCOLOR_BLUE:
+	case CONCOLOR_LIGHTBLUE:               return CHAT_CHANNEL_OTHER_BLUE;
+	case CONCOLOR_YELLOW:                  return CHAT_CHANNEL_OTHER_YELLOW;
+	case CONCOLOR_RED:                     return CHAT_CHANNEL_OTHER_RED;
+
+	default:                               return CHAT_CHANNEL_OTHER;                       // guess
+	}
+}
+
+// Channel names for output and filtering: the eChatChannel name, lowercased, without its
+// CHAT_CHANNEL_ prefix ("melee_your_hits"). Built once, from pairs so order can't drift.
+static const std::array<std::string, k_maxChatChannels>& ChannelNames()
+{
+	static const auto names = [] {
+		std::array<std::string, k_maxChatChannels> n;
+		for (int i = 0; i < k_maxChatChannels; ++i)
+			n[i] = fmt::format("channel_{}", i);
+#define CH(x) { CHAT_CHANNEL_##x, #x }
+		const std::pair<int, const char*> known[] = {
+			CH(SAY), CH(TELL), CH(GROUP), CH(RAID), CH(GUILD), CH(OOC), CH(AUCTION), CH(SHOUT),
+			CH(EMOTE), CH(MELEE_YOUR_HITS), CH(SPELLS_MINE), CH(SKILLS), CH(CHAT1), CH(CHAT2),
+			CH(CHAT3), CH(CHAT4), CH(CHAT5), CH(CHAT6), CH(CHAT7), CH(CHAT8), CH(CHAT9), CH(CHAT10),
+			CH(OTHER), CH(MELEE_YOUR_MISSES), CH(MELEE_YOU_BEING_HIT), CH(MELEE_YOU_BEING_MISSED),
+			CH(MELEE_OTHERS_HITS), CH(MELEE_OTHERS_MISSES), CH(MELEE_MY_DEATH),
+			CH(MELEE_OTHER_PC_DEATH), CH(MELEE_CRITICAL_HITS), CH(MELEE_DISCIPLINES),
+			CH(MELEE_WARNINGS), CH(MELEE_NPC_RAMPAGE), CH(MELEE_NPC_FLURRY), CH(MELEE_NPC_ENRAGE),
+			CH(SPELLS_OTHERS), CH(SPELLS_FAILURES), CH(SPELLS_CRITICALS), CH(SPELLS_WORN_OFF),
+			CH(SPELLS_DD_OTHERS), CH(FOCUS_EFFECTS), CH(RANDOM_YOUR_ROLLS), CH(PET_MESSAGES),
+			CH(PET_RAMPAGE_FLURRY), CH(PET_CRITICALS), CH(DAMAGE_SHIELDS_YOU_ATTACKING),
+			CH(EXPERIENCE_MESSAGES), CH(NPC_EMOTES), CH(SYSTEM_MESSAGES), CH(WHO), CH(PET_SPELLS),
+			CH(PET_RESPONSES), CH(ITEM_SPEECH), CH(FELLOWSHIP_MESSAGES), CH(MERCENARY_MESSAGES),
+			CH(PVP_MESSAGES), CH(MELEE_YOUR_FLURRY), CH(DEBUG), CH(MELEE_NPC_DEATH),
+			CH(RANDOM_OTHERS_ROLLS), CH(RANDOM_GROUP_RAID_ROLLS), CH(ENVIRONMENTAL_DAMAGE_YOURS),
+			CH(ENVIRONMENTAL_DAMAGE_OTHERS), CH(DAMAGE_SHIELDS_YOU_DEFENDING),
+			CH(DAMAGE_SHIELDS_OTHERS), CH(EVENT_MESSAGES),
+			CH(OVERWRITTEN_DETRIMENTAL_SPELL_MESSAGES), CH(OVERWRITTEN_BENEFICIAL_SPELL_MESSAGES),
+			CH(CANT_USE_COMMAND), CH(COMBAT_ABILITY_REUSE), CH(AA_ABILITY_REUSE), CH(DESTROY_ITEM),
+			CH(YOUR_AURAS), CH(OTHER_AURAS), CH(YOUR_HEALS), CH(OTHER_HEALS), CH(YOUR_DOTS),
+			CH(OTHER_DOTS), CH(BARD_SONGS), CH(OTHER_DIRECT_DAMAGE), CH(SPELL_EMOTES),
+			CH(FACTION_MESSAGES), CH(LOOT_MESSAGES), CH(TAUNT_MESSAGES), CH(OTHER_DISCIPLINES),
+			CH(YOUR_ACHIEVEMENTS), CH(OTHER_ACHIEVEMENTS), CH(FOOD_AND_DRINK), CH(RAID_VICTORY),
+			CH(OTHER_GREEN), CH(OTHER_BLUE), CH(OTHER_YELLOW), CH(OTHER_RED),
+			CH(CHAT_CHANNEL_INFO), CH(95), CH(SPELLS_DD_YOURS), CH(SPELLS_DD_OTHERS_CRITICAL),
+			CH(DOT_YOURS_CRITICAL), CH(DOT_OTHERS_CRITICAL), CH(DOT_YOU_BEING_HIT),
+			CH(HEALS_RECEIVED), CH(HEALS_YOUR_CRITICAL), CH(HEALS_OTHERS_CRITICAL),
+			CH(MELEE_OTHERS_CRITICAL),
+		};
+#undef CH
+		for (const auto& [id, name] : known)
+		{
+			std::string s = name;
+			for (char& c : s)
+				c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+			n[id] = std::move(s);
+		}
+		n[NUM_CHAT_CHANNELS]     = "spell_failures_other";      // guesses, see ChannelFromColor
+		n[NUM_CHAT_CHANNELS + 1] = "locked_inventory_slots";
+		return n;
+	}();
+	return names;
+}
+
+static std::string ChannelName(int channel)
+{
+	if (channel == k_channelMQ)
+		return "mq";
+	if (channel < 0 || channel >= k_maxChatChannels)
+		return "unknown";
+	return ChannelNames()[channel];
+}
+
+// This character's chat layout, from the UI ini. Written on the game thread (load/reload),
+// read on the game thread (tagging) and the HTTP thread (chat_tabs), hence the mutex.
+struct ChatLayout
+{
+	bool                                    loaded = false;
+	std::string                             file;
+	std::array<int, k_maxChatChannels>      windowOf{};     // channel -> window index, -1 none
+	std::array<std::string, MAX_CHAT_WINDOWS> names;        // window index -> tab name
+};
+
+static ChatLayout s_chatLayout;
+static std::mutex s_layoutMutex;
+
+// With personas (one character, several classes) EQ keeps a layout per class:
+// UI_<Name>_<server>_<CLS>.ini. Prefer the current class's file, then the plain
+// UI_<Name>_<server>.ini, then the newest suffixed one.
+static std::string FindUIIni(const std::string& name, const std::string& server, const std::string& classCode)
+{
+	namespace fs = std::filesystem;
+	std::error_code ec;
+	fs::path dir(gPathEverQuest);
+	if (!classCode.empty())
+	{
+		fs::path persona = dir / fmt::format("UI_{}_{}_{}.ini", name, server, classCode);
+		if (fs::exists(persona, ec))
+			return persona.string();
+	}
+	fs::path exact = dir / fmt::format("UI_{}_{}.ini", name, server);
+	if (fs::exists(exact, ec))
+		return exact.string();
+
+	std::string prefix = fmt::format("UI_{}_{}_", name, server);
+	fs::path best;
+	fs::file_time_type bestTime{};
+	for (const auto& entry : fs::directory_iterator(dir, ec))
+	{
+		std::string fn = entry.path().filename().string();
+		if (fn.size() <= prefix.size() + 4 || !ci_starts_with(fn, prefix) || !ci_ends_with(fn, ".ini"))
+			continue;
+		auto t = entry.last_write_time(ec);
+		if (best.empty() || t > bestTime)
+			best = entry.path(), bestTime = t;
+	}
+	return best.empty() ? exact.string() : best.string();
+}
+
+static void LoadChatLayout()
+{
+	ChatLayout layout;
+	layout.windowOf.fill(-1);
+	if (GetGameState() == GAMESTATE_INGAME && pLocalPlayer)
+	{
+		const char* cls = pLocalPlayer->GetClassThreeLetterCode();
+		layout.file = FindUIIni(pLocalPlayer->Name, GetServerShortName(), cls ? cls : "");
+
+		// One read of the whole section; ~150 GetPrivateProfileString calls would reopen
+		// a 6000-line file each time.
+		std::vector<char> buf(64 * 1024);
+		DWORD len = ::GetPrivateProfileSectionA("ChatManager", buf.data(), static_cast<DWORD>(buf.size()), layout.file.c_str());
+		for (const char* p = buf.data(); p < buf.data() + len && *p; p += strlen(p) + 1)
+		{
+			std::string_view kv(p);
+			size_t eq = kv.find('=');
+			if (eq == std::string_view::npos)
+				continue;
+			std::string_view key = kv.substr(0, eq), val = kv.substr(eq + 1);
+
+			int idx = 0;
+			if (key.rfind("ChannelMap", 0) == 0)
+			{
+				idx = GetIntFromString(std::string(key.substr(10)), -1);
+				if (idx >= 0 && idx < k_maxChatChannels)
+					layout.windowOf[idx] = GetIntFromString(std::string(val), -1);
+			}
+			else if (key.rfind("ChatWindow", 0) == 0 && key.size() > 5 && key.substr(key.size() - 5) == "_Name")
+			{
+				idx = GetIntFromString(std::string(key.substr(10, key.size() - 15)), -1);
+				if (idx >= 0 && idx < MAX_CHAT_WINDOWS)
+				{
+					// EQ pads default names ("Chat  3"); collapse runs of spaces for matching.
+					std::string name;
+					for (char c : val)
+						if (c != ' ' || (!name.empty() && name.back() != ' '))
+							name += c;
+					layout.names[idx] = name;
+				}
+			}
+		}
+		layout.loaded = len > 0;
+	}
+
+	std::lock_guard lock(s_layoutMutex);
+	s_chatLayout = std::move(layout);
+}
+
+// Tab a channel is shown in, "" if no layout is loaded or the channel isn't mapped.
+static std::string TabForChannel(int channel)
+{
+	if (channel == k_channelMQ)
+		return "MQ";
+	std::lock_guard lock(s_layoutMutex);
+	if (!s_chatLayout.loaded || channel < 0 || channel >= k_maxChatChannels)
+		return {};
+	int w = s_chatLayout.windowOf[channel];
+	if (w < 0 || w >= MAX_CHAT_WINDOWS)
+		return {};
+	return s_chatLayout.names[w].empty() ? fmt::format("Window {}", w) : s_chatLayout.names[w];
+}
+
 // Every line gets a monotonic sequence number so a caller can ask for "everything after
 // seq N" (chat_since, run_command) instead of guessing from the buffer length, which stops
 // working once a chatty client has filled the ring. Numbering restarts at 1 on plugin load.
+// channel/tab are resolved when the line arrives, so a later layout reload doesn't relabel it.
+struct ChatLink
+{
+	std::string type;   // spell, item, player, achievement, ...
+	int         id = 0; // spell or item id; 0 for other types
+	std::string text;   // what the chat window shows
+};
+
 struct ChatLine
 {
-	uint64_t    seq;
-	std::string text;
+	uint64_t              seq;
+	std::string           text;
+	int                   color   = 0;
+	int                   channel = k_channelUnknown;
+	std::string           tab;
+	std::vector<ChatLink> links;
+};
+
+// Item/spell/player links arrive as 0x12-delimited markup ("63^46875^38^'Vampiric Draw").
+// The ids are worth keeping -- spell names repeat across ranks, the id doesn't.
+static std::vector<ChatLink> ExtractChatLinks(const char* line)
+{
+	std::vector<ChatLink> out;
+	if (!strchr(line, ITEM_TAG_CHAR))
+		return out;
+
+	TextTagInfo tags[MAX_EXTRACT_LINKS];
+	size_t n = ExtractLinks(line, tags, MAX_EXTRACT_LINKS);
+	for (size_t i = 0; i < n && i < MAX_EXTRACT_LINKS; ++i)
+	{
+		ChatLink link;
+		link.text = std::string(tags[i].text);
+		switch (tags[i].tagCode)
+		{
+		case ETAG_SPELL:
+		{
+			link.type = "spell";
+			SpellLinkInfo info{};
+			if (ParseSpellLink(tags[i].link, info))
+				link.id = info.spellID;
+			break;
+		}
+		case ETAG_ITEM:
+		{
+			link.type = "item";
+			ItemLinkInfo info{};
+			if (ParseItemLink(tags[i].link, info))
+				link.id = info.itemID;
+			break;
+		}
+		case ETAG_PLAYER:           link.type = "player";      break;
+		case ETAG_ACHIEVEMENT:      link.type = "achievement"; break;
+		case ETAG_DIALOG_RESPONSE:  link.type = "dialog";      break;
+		case ETAG_FACTION:          link.type = "faction";     break;
+		case ETAG_COMMAND:
+		case ETAG_COMMAND2:         link.type = "command";     break;
+		default:                    link.type = "other";       break;
+		}
+		out.push_back(std::move(link));
+	}
+	return out;
+}
+
+// Which lines a chat read returns. Lists match case-insensitively; empty means "any".
+struct ChatFilter
+{
+	std::string              text;       // substring of the line
+	std::vector<std::string> tabs;       // line's tab is one of these
+	std::vector<std::string> channels;   // line's channel is one of these
+	std::vector<std::string> exclude;    // drop if tab or channel is one of these
+
+	bool Matches(const ChatLine& line) const
+	{
+		auto in = [](const std::vector<std::string>& list, const std::string& v) {
+			return std::any_of(list.begin(), list.end(), [&](const std::string& s) { return ci_equals(s, v); });
+		};
+		std::string channel = ChannelName(line.channel);
+		if (!text.empty() && ci_find_substr(line.text, text) < 0) return false;
+		if (!tabs.empty() && !in(tabs, line.tab))                 return false;
+		if (!channels.empty() && !in(channels, channel))          return false;
+		if (in(exclude, line.tab) || in(exclude, channel))        return false;
+		return true;
+	}
 };
 
 static std::deque<ChatLine> s_chatLines;
 static uint64_t             s_chatLastSeq = 0;   // seq of the newest line; guarded by s_chatMutex
 static std::mutex           s_chatMutex;
 
-static void PushChatLine(const char* line)
+// color is the USERCOLOR_* code for EQ chat; fromMQ marks MQ's own output (OnWriteChatColor),
+// whose color is just a display color.
+static void PushChatLine(const char* line, int color, bool fromMQ)
 {
+	int         channel = fromMQ ? k_channelMQ : ChannelFromColor(color);
+	std::string tab     = TabForChannel(channel);
+
+	// Keep the link ids, then reduce the markup to display text as MQ2DPSAdv does.
+	// StripTextLinks works in place and only shrinks.
+	std::vector<ChatLink> links = ExtractChatLinks(line);
+	std::vector<char>     unlinked;
+	if (strchr(line, ITEM_TAG_CHAR))
+	{
+		unlinked.assign(line, line + strlen(line) + 1);
+		StripTextLinks(unlinked.data());
+		line = unlinked.data();
+	}
+
 	// Strip MQ color codes (0x07 + letter) and non-ASCII bytes so the
 	// result is valid UTF-8 and safe to embed in JSON.
 	std::string clean;
@@ -147,7 +556,7 @@ static void PushChatLine(const char* line)
 	}
 
 	std::lock_guard lock(s_chatMutex);
-	s_chatLines.push_back({++s_chatLastSeq, std::move(clean)});
+	s_chatLines.push_back({++s_chatLastSeq, std::move(clean), color, channel, std::move(tab), std::move(links)});
 	if (s_chatLines.size() > k_chatBufferSize)
 		s_chatLines.pop_front();
 }
@@ -158,10 +567,10 @@ static uint64_t ChatLastSeq()
 	return s_chatLastSeq;
 }
 
-// Lines with seq > since, oldest first, at most maxLines, optionally only those containing
-// filter (case-insensitive). 'next' is the cursor for the following call: it advances past
-// filtered-out lines too, so a caller polling with a filter doesn't rescan them.
-static json ChatSince(uint64_t since, const std::string& filter, size_t maxLines)
+// Lines with seq > since that pass filter, oldest first, at most maxLines. 'next' is the
+// cursor for the following call: it advances past filtered-out lines too, so a caller
+// polling with a filter doesn't rescan them.
+static json ChatSince(uint64_t since, const ChatFilter& filter, size_t maxLines)
 {
 	std::lock_guard lock(s_chatMutex);
 
@@ -181,14 +590,26 @@ static json ChatSince(uint64_t since, const std::string& filter, size_t maxLines
 	for (size_t i = start; i < s_chatLines.size(); ++i)
 	{
 		const ChatLine& line = s_chatLines[i];
-		if (filter.empty() || ci_find_substr(line.text, filter) >= 0)
+		if (filter.Matches(line))
 		{
 			if (lines.size() == maxLines)
 			{
 				more = true;
 				break;
 			}
-			lines.push_back({{"seq", line.seq}, {"text", line.text}});
+			json l = {{"seq", line.seq}, {"channel", ChannelName(line.channel)}, {"text", line.text}};
+			if (!line.tab.empty())
+				l["tab"] = line.tab;
+			if (line.channel != k_channelMQ)
+				l["color"] = line.color;   // raw USERCOLOR_* code, for checking the channel mapping
+			for (const ChatLink& link : line.links)
+			{
+				json j = {{"type", link.type}, {"text", link.text}};
+				if (link.id)
+					j["id"] = link.id;
+				l["links"].push_back(std::move(j));
+			}
+			lines.push_back(std::move(l));
 		}
 		next = line.seq;
 	}
@@ -945,15 +1366,28 @@ static json HandleMCP(const json& req)
 				                "the 'next' value from the previous call as 'since' to read only new lines. "
 				                "'missed' counts lines that were evicted from the 4000-line buffer before you "
 				                "read them; 'reset' means the plugin reloaded and numbering restarted. "
-				                "'more' means max_lines was hit: call again with 'next'."},
+				                "'more' means max_lines was hit: call again with 'next'. Each line carries "
+				                "its EQ chat 'channel' (e.g. raid, guild, melee_others_hits, your_dots; MQ "
+				                "output is 'mq') and the 'tab' it shows in on this client (MQ output is "
+				                "tab 'MQ'); filter on either. Use chat_tabs to see the tab names."},
 				{"inputSchema", {
 					{"type",       "object"},
 					{"properties", {
 						{"since",     {{"type","integer"},{"description","Return lines with seq greater than this (default 0 = all buffered)"}}},
 						{"filter",    {{"type","string"}, {"description","Only lines containing this text (case-insensitive)"}}},
+						{"tabs",      {{"type","array"},  {"items",{{"type","string"}}}, {"description","Only lines shown in these chat tabs"}}},
+						{"channels",  {{"type","array"},  {"items",{{"type","string"}}}, {"description","Only lines on these channels"}}},
+						{"exclude",   {{"type","array"},  {"items",{{"type","string"}}}, {"description","Drop lines whose tab or channel is listed"}}},
 						{"max_lines", {{"type","integer"},{"description","Cap on lines returned (default 200)"}}}
 					}}
 				}}
+			},
+			{
+				{"name",        "chat_tabs"},
+				{"description", "List this client's chat tabs and the channels routed to each, as read from "
+				                "the character's UI ini. Use the tab and channel names with chat_since / "
+				                "run_command filters."},
+				{"inputSchema", {{"type","object"},{"properties",json::object()}}}
 			},
 			{
 				{"name",        "run_command"},
@@ -969,6 +1403,9 @@ static json HandleMCP(const json& req)
 						{"command",   {{"type","string"}, {"description","The full command including the leading slash"}}},
 						{"wait_ms",   {{"type","integer"},{"description","Extra time to collect output after the command runs, 0-10000 (default 500)"}}},
 						{"filter",    {{"type","string"}, {"description","Only lines containing this text (case-insensitive)"}}},
+						{"tabs",      {{"type","array"},  {"items",{{"type","string"}}}, {"description","Only lines shown in these chat tabs"}}},
+						{"channels",  {{"type","array"},  {"items",{{"type","string"}}}, {"description","Only lines on these channels"}}},
+						{"exclude",   {{"type","array"},  {"items",{{"type","string"}}}, {"description","Drop lines whose tab or channel is listed"}}},
 						{"max_lines", {{"type","integer"},{"description","Cap on lines returned (default 200)"}}}
 					}},
 					{"required",   {"command"}}
@@ -1179,12 +1616,34 @@ static json HandleMCP(const json& req)
 				std::this_thread::sleep_for(std::chrono::milliseconds(20));
 		};
 
+		// filter / tabs / channels / exclude. A list may also be given as one string.
+		auto chatFilterArg = [&]() {
+			auto list = [&](const char* key) {
+				std::vector<std::string> out;
+				if (!args.contains(key))
+					return out;
+				const json& a = args[key];
+				if (a.is_string())
+					out.push_back(a.get<std::string>());
+				else if (a.is_array())
+					for (const json& e : a)
+						if (e.is_string())
+							out.push_back(e.get<std::string>());
+				return out;
+			};
+			ChatFilter f;
+			f.text     = args.contains("filter") && args["filter"].is_string() ? args["filter"].get<std::string>() : "";
+			f.tabs     = list("tabs");
+			f.channels = list("channels");
+			f.exclude  = list("exclude");
+			return f;
+		};
+
 		if (tool == "chat_since")
 		{
 			uint64_t    since    = static_cast<uint64_t>(intArg("since", 0, 0, INT64_MAX));
 			size_t      maxLines = static_cast<size_t>(intArg("max_lines", 200, 1, k_chatBufferSize));
-			std::string filter   = args.value("filter", "");
-			json out = ChatSince(since, filter, maxLines);
+			json out = ChatSince(since, chatFilterArg(), maxLines);
 			return MakeOk(id, {{"content", {{{"type","text"},{"text", out.dump(2)}}}}});
 		}
 
@@ -1195,7 +1654,7 @@ static json HandleMCP(const json& req)
 				return MakeError(id, -32602, "command is required");
 			int64_t     waitMs   = intArg("wait_ms", 500, 0, 10000);
 			size_t      maxLines = static_cast<size_t>(intArg("max_lines", 200, 1, k_chatBufferSize));
-			std::string filter   = args.value("filter", "");
+			ChatFilter  filter   = chatFilterArg();
 
 			uint64_t since = ChatLastSeq();
 			auto     done  = std::make_shared<std::promise<void>>();
@@ -1216,6 +1675,26 @@ static json HandleMCP(const json& req)
 
 			json out = ChatSince(since, filter, maxLines);
 			out["command"] = cmd;
+			return MakeOk(id, {{"content", {{{"type","text"},{"text", out.dump(2)}}}}});
+		}
+
+		if (tool == "chat_tabs")
+		{
+			json tabs = json::object();
+			json out;
+			{
+				std::lock_guard lock(s_layoutMutex);
+				for (int ch = 0; ch < k_maxChatChannels; ++ch)
+				{
+					int w = s_chatLayout.windowOf[ch];
+					if (w < 0 || w >= MAX_CHAT_WINDOWS)
+						continue;
+					std::string tab = s_chatLayout.names[w].empty() ? fmt::format("Window {}", w) : s_chatLayout.names[w];
+					tabs[tab].push_back(ChannelName(ch));
+				}
+				out = {{"loaded", s_chatLayout.loaded}, {"file", s_chatLayout.file}, {"tabs", tabs}};
+			}
+			out["note"] = "MQ output is tab \"MQ\", channel \"mq\". Layout is read at login and by /mcp chat reload.";
 			return MakeOk(id, {{"content", {{{"type","text"},{"text", out.dump(2)}}}}});
 		}
 
@@ -1546,6 +2025,25 @@ static void Cmd_MCPStatus(PlayerClient* /*pChar*/, const char* szLine)
 		return;
 	}
 
+	// /mcp chat reload   re-read this character's chat tab layout from the UI ini
+	if (ci_equals(arg1, "chat"))
+	{
+		if (ci_equals(arg2, "reload"))
+			LoadChatLayout();
+		std::lock_guard lock(s_layoutMutex);
+		if (!s_chatLayout.loaded)
+			WriteChatf("\ag[MQMCP]\ax Chat layout not loaded%s%s   (/mcp chat reload)",
+				s_chatLayout.file.empty() ? "" : " from ", s_chatLayout.file.c_str());
+		else
+		{
+			int tabs = static_cast<int>(std::count_if(s_chatLayout.names.begin(), s_chatLayout.names.end(),
+				[](const std::string& n) { return !n.empty(); }));
+			WriteChatf("\ag[MQMCP]\ax Chat layout: \aw%d\ax tabs from \ay%s\ax   (/mcp chat reload)",
+				tabs, s_chatLayout.file.c_str());
+		}
+		return;
+	}
+
 	if (ci_equals(arg1, "port"))
 	{
 		std::string name = CurrentCharName();
@@ -1633,7 +2131,7 @@ static void Cmd_MCPStatus(PlayerClient* /*pChar*/, const char* szLine)
 PLUGIN_API DWORD OnWriteChatColor(const char* Line, DWORD Color, DWORD Filter)
 {
 	if (Line && *Line)
-		PushChatLine(Line);
+		PushChatLine(Line, static_cast<int>(Color), true);
 	return 0;
 }
 
@@ -1641,7 +2139,7 @@ PLUGIN_API DWORD OnWriteChatColor(const char* Line, DWORD Color, DWORD Filter)
 PLUGIN_API BOOL OnIncomingChat(const char* Line, DWORD Color)
 {
 	if (Line && *Line)
-		PushChatLine(Line);
+		PushChatLine(Line, static_cast<int>(Color), false);
 	return FALSE;  // don't suppress — let EQ display it normally
 }
 
@@ -1725,15 +2223,21 @@ PLUGIN_API void OnPulse()
 		try { q->result.set_value(std::move(values)); } catch (...) {}
 	}
 
-	// Apply the character's pinned port once per entry into the game. Polled here rather
-	// than in SetGameState because pLocalPlayer is not guaranteed to be set on the INGAME
-	// transition. Runs after the TLO drain so a rebind has no queries left to strand.
+	// Apply the character's pinned port and load its chat layout once per entry into the
+	// game. Polled here rather than in SetGameState because pLocalPlayer is not guaranteed
+	// to be set on the INGAME transition. Runs after the TLO drain so a rebind has no
+	// queries left to strand.
 	static bool s_pinChecked = false;
 	if (CurrentCharName().empty())
+	{
+		if (s_pinChecked)
+			LoadChatLayout();   // not in game: clears it, so char-select lines aren't tagged with old tabs
 		s_pinChecked = false;
+	}
 	else if (!s_pinChecked)
 	{
 		s_pinChecked = true;
+		LoadChatLayout();
 		ApplyPinnedPort();
 	}
 }

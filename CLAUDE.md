@@ -33,8 +33,9 @@ reverts them. What works today:
 
 ## Deploy
 
-MQ does not lock plugin DLLs: copy the build straight over
-`C:\Users\ew608\Desktop\MQ\plugins\MQMCP.dll`, then on each client
+The loaded DLL can be locked ("Device or resource busy"), but Windows allows renaming it:
+move `C:\Users\ew608\Desktop\MQ\plugins\MQMCP.dll` aside (`MQMCP.dll.old`), copy the
+build in, then on each client
 `/plugin mqmcp unload` and `/plugin mqmcp`. If you trigger that *through*
 the MCP itself, route the unload via `/timed` — commands run inside the plugin's own
 OnPulse, and unloading from within its own callback is unsafe.
@@ -87,6 +88,16 @@ them instead of `/echo` markers and client-side poll loops.
    nav ends (via `wait_for`).
 5. **Protocol version.** It reports `2024-11-05`. Moving to Streamable HTTP would let the
    SSE keepalive stub go. Not urgent while Claude Code accepts it.
+
+## Chat tabs
+
+Lines are tagged with a channel and the tab that shows them (see the comment block above
+`ChannelFromColor`). The color -> channel table is hand-made; entries marked `guess` there
+are unverified. Verified live on Terminaar (2026-10-27, combat dummy): 265, 273, 301, 327,
+349, 356, 380, 397, 402, 13; and 365 (event, green raid/mission text) on a spite mission,
+which rip's `utils/eventlog.lua` records via `chat_since` channels. The UI ini has a persona class suffix
+(`UI_Terminaar_bristle_SHD.ini`); `FindUIIni` picks the current class's file. When the user
+does a deploy, let them do it unless they ask; they often copy and reload themselves.
 
 ## Gotchas learned using it
 

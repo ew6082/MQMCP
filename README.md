@@ -28,6 +28,7 @@ Type `/mcp` in EverQuest to display server status: URL (with whether the port is
 | `/mcp` | Show status |
 | `/mcp port <n>` | Pin this character to port `<n>` (1024–65535) and rebind now |
 | `/mcp port auto` | Remove this character's pin and rebind to the first free port |
+| `/mcp chat` / `/mcp chat reload` | Show, or re-read, this character's chat tab layout |
 | `/mcp snapshot on\|off` | Enable or disable the state snapshot (saved in `MQMCP.ini` as `[Settings] Snapshot`) |
 
 The state snapshot behind `get_state`, the `eq://` resources and the debug REST endpoints is **off by default**. It reads EverQuest structs directly, and those reads crash the client when eqlib's struct offsets fall behind an EQ patch. While it's off, those return almost no game data, but `execute_command`, `query_tlo`, `query_tlo_batch` and chat still work.
@@ -97,15 +98,36 @@ Returns chat lines newer than a sequence number, oldest first.
 |-----------|------|-------------|
 | `since` | integer | Return lines with `seq` greater than this (default 0 = everything buffered) |
 | `filter` | string | Only lines containing this text (case-insensitive) |
+| `tabs` | string[] | Only lines shown in these chat tabs (see `chat_tabs`) |
+| `channels` | string[] | Only lines on these channels |
+| `exclude` | string[] | Drop lines whose tab or channel is listed |
 | `max_lines` | integer | Cap on lines returned (default 200) |
+
+`run_command` takes the same `tabs`, `channels` and `exclude` arguments.
 
 Each line in the buffer has a sequence number that only increases. `get_state` reports the newest one as `chat_seq`. The result looks like this:
 
 ```json
-{ "next": 1234, "more": false, "lines": [{ "seq": 1233, "text": "..." }, ...] }
+{ "next": 1234, "more": false,
+  "lines": [{ "seq": 1233, "channel": "melee_your_hits", "tab": "Combat", "color": 265, "text": "..." }, ...] }
 ```
 
+Each line has these fields:
+
+- `channel` is EQ's chat channel, named after eqlib's `eChatChannel` (`raid`, `guild`, `melee_others_hits`, `your_dots`, ...). MQ's own output, such as `/echo` and plugin messages, has the channel `mq`.
+- `tab` is the chat tab where the line is shown on this client. MQ output is in tab `MQ`.
+- `color` is the raw `USERCOLOR_*` code. It's included so that you can check the mapping from colors to channels.
+
+Tags are assigned when a line arrives. In `text`, item, spell and player links appear as their display text. When a line has links, `links` lists each one as `{type, id, text}`, where `id` is the spell or item ID. Spell names repeat across ranks, but the ID identifies the exact spell, for use with `Spell[<id>]`.
+
 Pass `next` as `since` on the next call. `next` moves past filtered-out lines too, so polling with a filter never rescans them. When `more` is `true`, `max_lines` was reached, so call again with `next`. `missed` (present only when non-zero) counts lines that were evicted from the 4000-line buffer before you read them. `reset: true` means the plugin was reloaded and numbering restarted from 1.
+
+---
+
+### `chat_tabs`
+Lists this client's chat tabs and the channels that are routed to each one.
+
+The layout comes from the character's UI ini in the EverQuest folder. For a character with personas, that's the file for the current class, `UI_<Name>_<server>_<CLS>.ini`. Otherwise it's `UI_<Name>_<server>.ini`. The plugin reads the file when you enter the game and when you run `/mcp chat reload`. EQ only writes tab changes to the file when you camp, so a change you make in game shows up after you log in again.
 
 ---
 
