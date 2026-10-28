@@ -94,7 +94,7 @@ them instead of `/echo` markers and client-side poll loops.
 Lines are tagged with a channel and the tab that shows them (see the comment block above
 `ChannelFromColor`). The color -> channel table is hand-made; entries marked `guess` there
 are unverified. Verified live on Terminaar (2026-10-27, combat dummy): 265, 273, 301, 327,
-349, 356, 380, 397, 402, 13; and 365 (event, green raid/mission text) on a spite mission,
+349, 356, 380, 397, 402, 13, 302 (your spell crits; the user routes them to Chat 3); and 365 (event, green raid/mission text) on a spite mission,
 which rip's `utils/eventlog.lua` records via `chat_since` channels. The UI ini has a persona class suffix
 (`UI_Terminaar_bristle_SHD.ini`); `FindUIIni` picks the current class's file. When the user
 does a deploy, let them do it unless they ask; they often copy and reload themselves.
