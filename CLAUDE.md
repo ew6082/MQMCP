@@ -68,13 +68,15 @@ Requests with an `Origin` header get a 403, and no CORS headers are sent (pre-ro
 handler in `SetupRoutes`). Before this, `Access-Control-Allow-Origin: *` with no auth
 let any web page POST `execute_command` to 127.0.0.1. Don't add CORS back.
 
-## Snapshot
+## Game state
 
-The struct-reading snapshot (`get_state`, `eq://` resources, REST) is off by default.
-Turn it on with `/mcp snapshot on|off` (`[Settings] Snapshot` in the ini, shared by all
-clients). Confirmed working on 2026-10-27 against the `Oct 19 2026` MQ build, and on
-in the ini since then. After an EQ patch, if a client crashes when the plugin loads,
-set `Snapshot=0` first. Off, `get_state` returns only `inGame` + chat; use `query_tlo_batch`.
+`get_state`, the `eq://` resources and the REST endpoints are built on demand from TLOs
+(`Build*Json` + `RunOnGameThread`, a `GameTask` queue drained in OnPulse), not from eqlib
+structs every pulse. The old struct snapshot and `/mcp snapshot` toggle are gone; a stale
+`[Settings] Snapshot` key in the ini is ignored. Chat is out of `get_state` unless
+`max_chat` is given. Gems are 1-based, buffs report `seconds`. **Not yet tested live**
+(committed 2026-10-29 before deploy): run the scratchpad `test_state.py`-style checks
+(timings, fields vs `query_tlo_batch`, every `eq://` URI) on the first load.
 
 ## To-do
 
@@ -85,13 +87,12 @@ also tell the user what's happening in the MQ chat window. Read them from the MC
 Port discovery (`MQMCP_Clients.ini`, `GET /whoami`, `list_clients`, `query_peer`) is done
 and confirmed live on all 12 clients (2026-10-29).
 
-1. **Slimmer `get_state`.** It still returns the full chat buffer (action tools now send
-   only the last 20 lines). With `chat_since` available, chat could go from get_state
-   entirely (keep `chat_seq`), or become opt-in (`max_chat`).
-2. **Build `get_state` from TLOs** (one `query_tlo_batch`-style evaluation) instead of
-   struct reads, so an EQ patch can't crash it and the snapshot toggle can go.
-3. **`navigate_to` by spawn/target** (`/nav id`, `/nav target`), optionally waiting until
+1. **Verify the TLO-built `get_state` live** (see Game state), then mark it done here.
+2. **`navigate_to` by spawn/target** (`/nav id`, `/nav target`), optionally waiting until
    nav ends (via `wait_for`).
+3. **Combat abilities on demand** (`eq://abilities` or a tool): known discs with ready /
+   seconds remaining, optionally only those on cooldown. Not in `get_state` — a 130 knows
+   hundreds. The upstream README documented an `abilities` list that was never implemented.
 4. **Protocol version.** It reports `2024-11-05`. Moving to Streamable HTTP would let the
    SSE keepalive stub go. Not urgent while Claude Code accepts it.
 

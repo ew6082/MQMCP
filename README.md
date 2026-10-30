@@ -30,18 +30,21 @@ Type `/mcp` in EverQuest to display server status: URL (with whether the port is
 | `/mcp port <n>` | Pin this character to port `<n>` (1024–65535) and rebind now |
 | `/mcp port auto` | Remove this character's pin and rebind to the first free port |
 | `/mcp chat` / `/mcp chat reload` | Show, or re-read, this character's chat tab layout |
-| `/mcp snapshot on\|off` | Enable or disable the state snapshot (saved in `MQMCP.ini` as `[Settings] Snapshot`) |
 
-The state snapshot behind `get_state`, the `eq://` resources and the debug REST endpoints is **off by default**. It reads EverQuest structs directly, and those reads crash the client when eqlib's struct offsets fall behind an EQ patch. While it's off, those return almost no game data, but `execute_command`, `query_tlo`, `query_tlo_batch` and chat still work.
+`get_state`, the `eq://` resources and the debug REST endpoints read the game through MQ's TLOs, on the game thread, when they are asked. Nothing is read between requests. (Earlier versions copied EverQuest structs every pulse behind a `/mcp snapshot` toggle; that and the `[Settings] Snapshot` ini key are gone.)
 
 You have to be logged in to a character to use `/mcp port`, because pins are stored per character.
 
 ## MCP Tools
 
 ### `get_state`
-Returns a full game state snapshot. Call this after any action to observe the result.
+Returns the current game state, read from one game frame. Call this after any action to observe the result.
 
-**Returns:** JSON object with all state fields (see State Fields below).
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `max_chat` | integer | Also return this many of the newest chat lines as `recent_chat` (default 0) |
+
+**Returns:** JSON object with all state fields (see State Fields below). Chat is left out by default. Read it with `chat_since`, starting from the returned `chat_seq`.
 
 ---
 
@@ -52,7 +55,7 @@ Executes any MacroQuest or EverQuest slash command on the next game pulse.
 |-----------|------|-------------|
 | `command` | string | Full command including leading slash, e.g. `/cast 1`, `/attack on` |
 
-Commands are queued and executed in order on the next EQ pulse. The response includes a state snapshot captured before the command runs, with only the last 20 chat lines. Its `chat_seq` is taken before the command was queued, so `chat_since` with that value returns the command's output. To get the output in one call, use `run_command`.
+Commands are queued and executed in order on the next EQ pulse. The response includes the game state read on that same pulse, just after the command was issued, with the last 20 chat lines. Its `chat_seq` is taken before the command was queued, so `chat_since` with that value returns the command's output. To get the output in one call, use `run_command`.
 
 ---
 
@@ -181,39 +184,32 @@ The `get_state` tool (and the inline state returned with each command) returns:
   "group_size": 2,
 
   "aggressors": [
-    { "name": "a fallen spirit", "level": 67, "distance": 6.5 }
+    { "name": "a fallen spirit", "id": 4411, "level": 67, "distance": 6.5 }
   ],
 
   "target": {
-    "name": "a_fallen_spirit01",
+    "name": "a fallen spirit",
     "type": "NPC",
     "distance": 6.5,
     "hp_pct": 45,
-    "buffs": []
+    "buffs": [ { "name": "Tashan's Lingering Cry", "id": 2884, "seconds": 54 } ]
   },
 
   "mem_spells": [
-    { "gem": 0, "id": 1234, "name": "Complete Heal", "ready": true,  "ms_remaining": 0 },
-    { "gem": 1, "id": 5678, "name": "Yaulp IV",      "ready": false, "ms_remaining": 14000 }
-  ],
-
-  "abilities": [
-    { "index": 0, "disc_cmd_index": 1, "name": "Mighty Strike", "id": 704,  "ready": true,  "secs_remaining": 0 },
-    { "index": 1, "disc_cmd_index": 2, "name": "Defensive",     "id": 705,  "ready": false, "secs_remaining": 47 }
+    { "gem": 1, "id": 1234, "name": "Complete Heal", "ready": true,  "ms_remaining": 0 },
+    { "gem": 2, "id": 5678, "name": "Yaulp IV",      "ready": false, "ms_remaining": 14000 }
   ],
 
   "active_buffs": [
-    { "id": 1534, "name": "Yaulp IV", "duration": 6, "song": false }
+    { "id": 1534, "name": "Yaulp IV", "seconds": 36 },
+    { "id": 8001, "name": "Selo's Accelerating Chorus", "seconds": 18, "song": true }
   ],
 
   "loot_available": [
-    { "name": "Blade of Ravenglass' Victim", "noDrop": true, "personal": true }
+    { "name": "Blade of Ravenglass' Victim", "id": 99001, "noDrop": true, "stackSize": 1, "personal": true }
   ],
 
-  "recent_chat": [
-    "You slash a fallen spirit for 1140 points of damage. (Slay Undead)",
-    "You have slain a fallen spirit!"
-  ]
+  "chat_seq": 10422
 }
 ```
 
@@ -227,19 +223,18 @@ The `get_state` tool (and the inline state returned with each command) returns:
 | `class` | Class name (e.g. `"Paladin"`, `"Warrior"`) |
 | `hp_pct` / `mana_pct` | Health / mana as 0–100 integer |
 | `endurance_pct` | Endurance as 0–100 integer |
-| `invisible` | `true` if HideMode is active |
-| `moving` | `true` if position changed since last snapshot |
+| `invisible` | `true` if you have any invisibility (`Me.Invis`) |
+| `moving` | `true` if you are moving (`Me.Moving`) |
 | `position` | `{x, y, z}` world coordinates |
 | `zone` | Zone short name |
-| `aggro_count` | Number of NPCs in XTarget window |
-| `group_size` | Total group members including self |
-| `aggressors` | XTarget entries currently hostile to you |
-| `target` | Current target with name, type, distance, hp_pct, and visible buffs |
-| `mem_spells` | Memorized spell gems (0-indexed) with ready status and `ms_remaining` until ready |
-| `abilities` | Known combat abilities/disciplines with ready status and `secs_remaining` until ready (seconds, not ms) |
-| `active_buffs` | Self buffs and songs with remaining duration in ticks (`-1` = permanent, `-4` = song/disc) |
+| `aggro_count` | Number of `aggressors` |
+| `group_size` | Total group members including self, 0 when ungrouped |
+| `aggressors` | NPCs in this zone on your XTarget window (slots holding group members are skipped) |
+| `target` | Current target with name, type, distance, hp_pct, and buffs (from MQ's buff cache, so NPC targets have them too) |
+| `mem_spells` | Memorized spell gems, numbered from 1 as `/cast` uses them, with `ready` (`Me.SpellReady`) and `ms_remaining` until the gem's recast ends |
+| `active_buffs` | Self buffs, then songs (marked `song: true`), with `seconds` remaining |
 | `loot_available` | Items in the AdvLoot window (personal and shared) |
-| `recent_chat` | Buffered game chat, up to 4000 lines (combat, spells, system, say, group, etc.). Action tools include only the last 20. |
+| `recent_chat` | Only with `max_chat`: the newest chat lines. Action tool replies include the last 20. |
 | `chat_seq` | Sequence number of the newest chat line, to pass to `chat_since`. In action tool responses, it is taken before the command was queued. |
 
 ## MCP Resources
@@ -252,9 +247,8 @@ In addition to tools, the server exposes MCP resources for granular reads:
 | `eq://zone` | Current zone name and ID |
 | `eq://target` | Current target details |
 | `eq://spawns` | All spawns within 300 units, sorted by distance |
-| `eq://spells` | Memorized spell gems |
-| `eq://cooldowns` | Spell gem and combat ability/disc recast timers (combined) |
-| `eq://abilities` | Known combat abilities/disciplines with readiness and cooldowns |
+| `eq://spells` | Memorized spell gems with recast state |
+| `eq://cooldowns` | Same as `eq://spells` |
 | `eq://buffs` | Active buffs and songs on self |
 | `eq://loot` | Items currently in the AdvLoot window |
 | `eq://group` | Group members with HP%, mana%, level, and role |
@@ -270,28 +264,7 @@ MQ color codes (`0x07` + letter) and non-ASCII bytes are stripped so all strings
 
 ## Combat Abilities / Disciplines
 
-Combat abilities and disciplines are returned in `abilities[]` within the state snapshot, and also via `eq://abilities` and `eq://cooldowns`.
-
-Each entry includes:
-
-| Field | Description |
-|-------|-------------|
-| `index` | 0-based slot index in the combat abilities array |
-| `disc_cmd_index` | 1-based index to pass to `/disc <n>` |
-| `name` | Spell/disc name |
-| `id` | Spell ID |
-| `ready` | `true` if the ability is off cooldown |
-| `secs_remaining` | Seconds until ready (0 if ready) — **seconds**, not ms |
-
-To use a combat ability:
-
-```
-/disc <disc_cmd_index>
-```
-
-Always check `ready` or `secs_remaining == 0` before using a disc.
-
-The `eq://cooldowns` resource returns **both** spell gems and combat abilities in one list. Each entry has a `type` field (`"spell_gem"` or `"ability"`) to distinguish them.
+The state doesn't list combat abilities. (The upstream README described an `abilities` list and `eq://abilities`, but the plugin never had them.) Read them with `query_tlo_batch`, e.g. `Me.CombatAbilityReady[Mighty Strike]` and `Me.CombatAbilityTimer[Mighty Strike].TotalSeconds`.
 
 ## Loot Commands
 
@@ -490,7 +463,7 @@ The registry is its own file rather than a section of `MQMCP.ini`. The Windows p
 
 - Commands are executed on the EQ main thread (game pulse) — never from the HTTP thread
 - Requests that carry an `Origin` header are refused with 403, and no CORS headers are sent. Browsers add that header and MCP clients don't, so a web page can't drive the client through `127.0.0.1`.
-- State snapshots update every pulse (~100ms)
+- Game state is read on request, on the next pulse after it is asked for (~100ms at most)
 - Nearby spawns are capped at 60, sorted by distance, within 300 units
 - MQ2Nav must be loaded for `navigate_to` to work
 - The plugin does not suppress any chat (all `OnIncomingChat` handlers return `FALSE`)

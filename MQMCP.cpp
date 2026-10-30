@@ -42,6 +42,7 @@
 #include <array>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <mutex>
 #include <queue>
@@ -623,525 +624,325 @@ static json ChatSince(uint64_t since, const ChatFilter& filter, size_t maxLines)
 }
 
 //============================================================================
-// Cached game state — written on pulse (main thread), read by HTTP thread
+// Game state, read through MQ's TLOs
+//
+// Built on demand on the game thread from TLO expressions instead of being copied out of
+// eqlib structs every pulse. The TLOs are maintained with eqlib by the MQ devs, so this
+// carries no struct layouts of its own, and it costs nothing between requests.
 //============================================================================
 
-struct SpawnSnapshot
+// Work for the game thread that hands back a JSON result -- the counterpart of TloQuery
+// for callers that need several dependent reads (a count, then each entry) in one frame.
+struct GameTask
 {
-	int         id;
-	std::string name;
-	std::string type;
-	int         level;
-	float       x, y, z;
-	float       distance;
+	std::function<json()> build;
+	std::promise<json>    result;
 };
 
-struct GameSnapshot
+static std::queue<std::shared_ptr<GameTask>> s_taskQueue;
+static std::mutex                            s_taskMutex;
+
+// Runs `build` on the next pulse and waits for it, with the same 5s budget as a TLO query.
+static bool RunOnGameThread(std::function<json()> build, json& out, std::string& err)
 {
-	bool inGame = false;
-
-	// Player
-	std::string playerName;
-	std::string playerClass;
-	int         playerLevel   = 0;
-	int         playerClassId = 0;
-	float       playerX = 0, playerY = 0, playerZ = 0;
-	bool        isMoving      = false;   // true if position changed since last snapshot
-	bool        isInvisible   = false;
-	int64_t     hp = 0,  hpMax = 0;
-	int         mana = 0, manaMax = 0;
-	int         endurance = 0, enduranceMax = 0;
-
-	// Zone
-	std::string zoneLongName;
-	std::string zoneShortName;
-	int         zoneId = 0;
-
-	// Target
-	bool        hasTarget   = false;
-	std::string targetName;
-	int         targetId    = 0;
-	std::string targetType;
-	float       targetDist  = 0.f;
-	int64_t     targetHp    = 0;
-	int64_t     targetHpMax = 0;
-	int         targetLevel = 0;
-
-	// Nearby spawns (within 300 units, capped at 60, sorted by distance)
-	std::vector<SpawnSnapshot> spawns;
-
-	// AdvLoot items available to loot
-	struct LootEntry {
-		std::string name;
-		bool        noDrop    = false;
-		bool        stackable = false;
-		int         stackSize = 1;
-		bool        personal  = false;  // true = personal loot, false = shared
-	};
-	std::vector<LootEntry> lootItems;
-
-	// Memorized spells (gem slots 0-based)
-	struct SpellGem {
-		int         gem         = 0;
-		int         spellId     = -1;
-		std::string name;
-		uint32_t    msRemaining = 0;   // recast timer; read here so the HTTP thread never does
-	};
-	std::vector<SpellGem> memSpells;
-
-	// Extended targets (XTarget window) — active aggressors/haters
-	struct XTargetEntry {
-		std::string name;
-		int         spawnId  = 0;
-		float       distance = 0.f;
-		int         level    = 0;
-	};
-	std::vector<XTargetEntry> xTargets;   // only occupied, in-zone slots
-	int xTargetCount = 0;                 // total occupied slots
-
-	// Group members
-	struct GroupMember {
-		std::string name;
-		std::string ownerName;   // mercenary owner
-		int         level    = 0;
-		int         type     = 0;  // EQP_PC=0, mercenary etc
-		bool        offline  = false;
-		bool        isLeader = false;
-		int         hpPct    = 0;  // 0 if no spawn data
-		int         manaPct  = 0;
-	};
-	std::vector<GroupMember> groupMembers;
-
-	// Active buffs on self (long buffs + songs/disciplines)
-	struct BuffEntry {
-		int         spellId  = 0;
-		std::string name;
-		int         duration = 0;   // remaining ticks
-		bool        song     = false;
-	};
-	std::vector<BuffEntry> buffs;
-
-	// Visible buffs/debuffs on current target
-	std::vector<BuffEntry> targetBuffs;
-};
-
-static GameSnapshot s_snapshot;
-static std::mutex   s_snapshotMutex;
-// OFF by default: the snapshot reads PlayerClient/spawn fields directly, which crash
-// when eqlib's struct offsets lag an EQ patch. The server still serves execute_command,
-// query_tlo and chat. /mcp snapshot on|off toggles it ([Settings] Snapshot in the ini).
-static bool         s_snapshotEnabled = false;
-
-static const char* SpawnTypeName(int type)
-{
-	switch (type)
+	auto task   = std::make_shared<GameTask>();
+	task->build = std::move(build);
+	auto fut    = task->result.get_future();
 	{
-	case SPAWN_PLAYER: return "PC";
-	case SPAWN_NPC:    return "NPC";
-	case SPAWN_CORPSE: return "Corpse";
-	default:           return "Unknown";
+		std::lock_guard lock(s_taskMutex);
+		s_taskQueue.push(task);
 	}
+	if (fut.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
+	{
+		err = "Timed out waiting for the game thread (is the client pulsing?)";
+		return false;
+	}
+	try { out = fut.get(); }
+	catch (const std::exception& e) { err = std::string("Game-thread read failed: ") + e.what(); return false; }
+	return true;
 }
 
-static void UpdateSnapshot()
+static bool InGame()
 {
-	// Struct field reads below are skipped unless s_snapshotEnabled (see its comment).
-	GameSnapshot snap;
-	// GetGameState()/pLocalPlayer-null are safe (not struct field reads), so always set
-	// inGame accurately — the command queue, chat reader and resources gate on it.
-	snap.inGame = (GetGameState() == GAMESTATE_INGAME && pLocalPlayer != nullptr);
-
-	if (!s_snapshotEnabled || !snap.inGame)
-	{
-		std::lock_guard lock(s_snapshotMutex);
-		s_snapshot = snap;   // inGame preserved; struct field reads skipped (avoids crash)
-		return;
-	}
-
-	// ---- Player ----
-	snap.playerName    = pLocalPlayer->Name;
-	snap.playerLevel   = pLocalPlayer->Level;
-	snap.playerClassId = static_cast<int>(pLocalPlayer->GetClass());
-	if (const char* cls = pLocalPlayer->GetClassString())
-		snap.playerClass = cls;
-	snap.playerX       = pLocalPlayer->X;
-	snap.playerY       = pLocalPlayer->Y;
-	snap.playerZ       = pLocalPlayer->Z;
-	snap.isMoving      = (snap.playerX != s_snapshot.playerX ||
-	                      snap.playerY != s_snapshot.playerY ||
-	                      snap.playerZ != s_snapshot.playerZ);
-	snap.isInvisible   = (pLocalPlayer->HideMode != 0);
-	snap.hp            = pLocalPlayer->HPCurrent;
-	snap.hpMax         = pLocalPlayer->HPMax;
-	snap.mana          = GetCurMana();
-	snap.manaMax       = GetMaxMana();
-	snap.endurance     = GetCurEndurance();
-	snap.enduranceMax  = GetMaxEndurance();
-
-	// ---- Zone ----
-	if (pZoneInfo)
-	{
-		snap.zoneLongName  = pZoneInfo->LongName;
-		snap.zoneShortName = pZoneInfo->ShortName;
-		snap.zoneId        = pZoneInfo->ZoneID & 0x7FFF;
-	}
-
-	// ---- Target ----
-	if (pTarget)
-	{
-		snap.hasTarget   = true;
-		snap.targetName  = pTarget->Name;
-		snap.targetId    = pTarget->SpawnID;
-		snap.targetLevel = pTarget->Level;
-		snap.targetHp    = pTarget->HPCurrent;
-		snap.targetHpMax = pTarget->HPMax;
-		snap.targetType  = SpawnTypeName(pTarget->Type);
-		snap.targetDist  = Distance3DToSpawn(pLocalPlayer, pTarget);
-	}
-
-	// ---- Nearby spawns ----
-	for (SPAWNINFO* pSpawn = (SPAWNINFO*)pSpawnList; pSpawn; pSpawn = pSpawn->pNext)
-	{
-		if (pSpawn == pLocalPlayer)
-			continue;
-
-		float dist = Distance3DToSpawn(pLocalPlayer, pSpawn);
-		if (dist > 300.f)
-			continue;
-
-		SpawnSnapshot ss;
-		ss.id       = pSpawn->SpawnID;
-		ss.name     = pSpawn->Name;
-		ss.level    = pSpawn->Level;
-		ss.type     = SpawnTypeName(pSpawn->Type);
-		ss.x        = pSpawn->X;
-		ss.y        = pSpawn->Y;
-		ss.z        = pSpawn->Z;
-		ss.distance = dist;
-
-		snap.spawns.push_back(ss);
-	}
-
-	std::sort(snap.spawns.begin(), snap.spawns.end(),
-	          [](const SpawnSnapshot& a, const SpawnSnapshot& b) { return a.distance < b.distance; });
-
-	if (snap.spawns.size() > 60)
-		snap.spawns.resize(60);
-
-	// ---- AdvLoot items ----
-	if (pAdvancedLootWnd)
-	{
-		auto collectItems = [&](AdvancedLootItemList* list, bool personal) {
-			if (!list) return;
-			int count = list->Items.GetSize();
-			for (int i = 0; i < count; ++i)
-			{
-				const AdvancedLootItem& li = list->Items[i];
-				if (li.Name[0] == '\0') continue;
-
-				GameSnapshot::LootEntry entry;
-				entry.name      = li.Name;
-				entry.noDrop    = li.NoDrop;
-				entry.stackable = li.bStackable;
-				entry.stackSize = li.bStackable ? li.MaxStack : 1;
-				entry.personal  = personal;
-				snap.lootItems.push_back(entry);
-			}
-		};
-
-		collectItems(pAdvancedLootWnd->pPLootList, true);
-		collectItems(pAdvancedLootWnd->pCLootList, false);
-	}
-
-	// ---- Memorized spells ----
-	if (PcProfile* pProfile = GetPcProfile())
-	{
-		for (int gem = 0; gem < MAX_MEMORIZED_SPELLS; ++gem)
-		{
-			int spellId = pProfile->GetMemorizedSpell(gem);
-			if (spellId <= 0)
-				continue;
-
-			GameSnapshot::SpellGem sg;
-			sg.gem         = gem;
-			sg.spellId     = spellId;
-			sg.msRemaining = GetSpellGemTimer(gem);
-
-			if (EQ_Spell* pSpell = GetSpellByID(spellId))
-				sg.name = pSpell->Name;
-
-			snap.memSpells.push_back(sg);
-		}
-	}
-
-	// ---- Group members ----
-	if (pLocalPC && pLocalPC->Group)
-	{
-		CGroup* pGrp = pLocalPC->Group;
-		for (int i = 0; i < (int)pGrp->GetMaxGroupSize(); ++i)
-		{
-			CGroupMember* pMem = pGrp->GetGroupMember(i);
-			if (!pMem || pMem->Name.empty()) continue;
-
-			GameSnapshot::GroupMember gm;
-			gm.name      = pMem->Name.c_str();
-			gm.ownerName = pMem->OwnerName.c_str();
-			gm.level     = pMem->Level;
-			gm.type      = pMem->Type;
-			gm.offline   = pMem->bIsOffline;
-			gm.isLeader  = (pMem == pGrp->GetGroupLeader());
-
-			if (PlayerClient* pSpawn = pMem->pPlayer)
-			{
-				int64_t hp  = pSpawn->HPCurrent, hpMax = pSpawn->HPMax;
-				gm.hpPct   = hpMax > 0 ? static_cast<int>(hp * 100 / hpMax) : 0;
-				int mana = 0, manaMax = 0;
-				if (pMem->pPlayer == pLocalPlayer)
-				{
-					mana    = GetCurMana();
-					manaMax = GetMaxMana();
-				}
-				else
-				{
-					mana    = pSpawn->GetCurrentMana();
-					manaMax = pSpawn->GetMaxMana();
-				}
-				gm.manaPct = manaMax > 0 ? mana * 100 / manaMax : 0;
-			}
-
-			snap.groupMembers.push_back(gm);
-		}
-	}
-
-	// ---- Self buffs (long + songs/disciplines) ----
-	if (pLocalPC)
-	{
-		auto collectBuffs = [&](auto&& getEffect, int count, bool isSong) {
-			for (int i = 0; i < count; ++i)
-			{
-				const EQ_Affect& affect = getEffect(i);
-				if (affect.SpellID <= 0) continue;
-
-				GameSnapshot::BuffEntry entry;
-				entry.spellId  = affect.SpellID;
-				entry.duration = affect.Duration;
-				entry.song     = isSong;
-
-				if (EQ_Spell* pSpell = GetSpellByID(affect.SpellID))
-					entry.name = pSpell->Name;
-
-				snap.buffs.push_back(entry);
-			}
-		};
-
-		collectBuffs([&](int i) -> const EQ_Affect& { return pLocalPC->GetEffect(i); },    NUM_LONG_BUFFS, false);
-		collectBuffs([&](int i) -> const EQ_Affect& { return pLocalPC->GetTempEffect(i); }, NUM_TEMP_BUFFS, true);
-	}
-
-	// ---- Target buffs (visible effects on target, PC targets only) ----
-	if (pTarget && pTarget->Type == SPAWN_PLAYER)
-	{
-		// Only PC targets have a PcClient buff list accessible this way
-		if (PcClient* pTargetPC = pTarget->GetPcClient())
-		{
-			for (int i = 0; i < NUM_LONG_BUFFS; ++i)
-			{
-				const EQ_Affect& affect = pTargetPC->GetEffect(i);
-				if (affect.SpellID <= 0) continue;
-
-				GameSnapshot::BuffEntry entry;
-				entry.spellId  = affect.SpellID;
-				entry.duration = affect.Duration;
-				entry.song     = false;
-
-				if (EQ_Spell* pSpell = GetSpellByID(affect.SpellID))
-					entry.name = pSpell->Name;
-
-				snap.targetBuffs.push_back(entry);
-			}
-		}
-	}
-
-	// ---- Extended targets (XTarget window) ----
-	if (pLocalPC && pLocalPC->pXTargetMgr)
-	{
-		ExtendedTargetList* xtm = pLocalPC->pXTargetMgr;
-		int numSlots = xtm->GetNumSlots();
-		for (int i = 0; i < numSlots; ++i)
-		{
-			ExtendedTargetSlot* xts = xtm->GetSlot(i);
-			if (!xts || xts->XTargetSlotStatus != eXTSlotCurrentZone || xts->SpawnID == 0)
-				continue;
-
-			++snap.xTargetCount;
-
-			GameSnapshot::XTargetEntry entry;
-			entry.spawnId = xts->SpawnID;
-			entry.name    = xts->Name;
-
-			if (SPAWNINFO* pSpawn = GetSpawnByID(xts->SpawnID))
-			{
-				entry.level    = pSpawn->Level;
-				entry.distance = Distance3DToSpawn(pLocalPlayer, pSpawn);
-			}
-
-			snap.xTargets.push_back(entry);
-		}
-	}
-
-	std::lock_guard lock(s_snapshotMutex);
-	s_snapshot = std::move(snap);
+	return GetGameState() == GAMESTATE_INGAME && pLocalPlayer != nullptr;
 }
 
-//============================================================================
-// JSON builders
-//============================================================================
-
-static json BuildPlayerJson(const GameSnapshot& s)
+// One TLO expression (no ${}), evaluated with parser 2 like query_tlo. Game thread only.
+// Unresolved values come back empty rather than as "NULL".
+static std::string Tlo(const std::string& expr)
 {
-	int hpPct = s.hpMax  > 0 ? static_cast<int>(s.hp  * 100 / s.hpMax)  : 0;
-	int mnPct = s.manaMax > 0 ? s.mana * 100 / s.manaMax : 0;
-
-	return {
-		{"name",        s.playerName},
-		{"level",       s.playerLevel},
-		{"classId",     s.playerClassId},
-		{"invisible",   s.isInvisible},
-		{"position",    {{"x", s.playerX}, {"y", s.playerY}, {"z", s.playerZ}}},
-		{"hp",          {{"current", s.hp},        {"max", s.hpMax},       {"pct", hpPct}}},
-		{"mana",        {{"current", s.mana},       {"max", s.manaMax},     {"pct", mnPct}}},
-		{"endurance",   {{"current", s.endurance},  {"max", s.enduranceMax}}}
-	};
+	std::string wrapped = "${" + expr + "}";
+	char buffer[MAX_STRING] = { 0 };
+	strncpy_s(buffer, wrapped.c_str(), sizeof(buffer) - 1);
+	auto oldParser = std::exchange(gParserVersion, 2);
+	ParseMacroData(buffer, sizeof(buffer));
+	gParserVersion = oldParser;
+	std::string value = buffer;
+	return value == "NULL" || value == wrapped ? std::string() : value;
 }
 
-static json BuildZoneJson(const GameSnapshot& s)
+static int64_t TloInt(const std::string& expr)   { return std::strtoll(Tlo(expr).c_str(), nullptr, 10); }
+static float   TloFloat(const std::string& expr) { return GetFloatFromString(Tlo(expr), 0.f); }
+static bool    TloBool(const std::string& expr)  { return ci_equals(Tlo(expr), "TRUE"); }
+
+static json PositionJson(const std::string& spawn)
+{
+	return {{"x", TloFloat(spawn + ".X")}, {"y", TloFloat(spawn + ".Y")}, {"z", TloFloat(spawn + ".Z")}};
+}
+
+//----------------------------------------------------------------------------
+// Builders -- game thread only. Each assumes InGame().
+//----------------------------------------------------------------------------
+
+static json BuildPlayerJson()
 {
 	return {
-		{"longName",  s.zoneLongName},
-		{"shortName", s.zoneShortName},
-		{"id",        s.zoneId}
+		{"name",      Tlo("Me.CleanName")},
+		{"level",     TloInt("Me.Level")},
+		{"class",     Tlo("Me.Class.Name")},
+		{"classId",   TloInt("Me.Class.ID")},
+		{"invisible", TloBool("Me.Invis")},
+		{"position",  PositionJson("Me")},
+		{"hp",        {{"current", TloInt("Me.CurrentHPs")},       {"max", TloInt("Me.MaxHPs")},       {"pct", TloInt("Me.PctHPs")}}},
+		{"mana",      {{"current", TloInt("Me.CurrentMana")},      {"max", TloInt("Me.MaxMana")},      {"pct", TloInt("Me.PctMana")}}},
+		{"endurance", {{"current", TloInt("Me.CurrentEndurance")}, {"max", TloInt("Me.MaxEndurance")}, {"pct", TloInt("Me.PctEndurance")}}}
 	};
 }
 
-static json BuildTargetJson(const GameSnapshot& s)
+static json BuildZoneJson()
 {
-	if (!s.hasTarget)
-		return nullptr;
-
-	json tBuffs = json::array();
-	for (const GameSnapshot::BuffEntry& b : s.targetBuffs)
-		tBuffs.push_back({{"name", b.name}, {"id", b.spellId}, {"duration", b.duration}});
-
 	return {
-		{"name",     s.targetName},
-		{"id",       s.targetId},
-		{"type",     s.targetType},
-		{"level",    s.targetLevel},
-		{"distance", s.targetDist},
-		{"hp",       {{"current", s.targetHp}, {"max", s.targetHpMax}}},
-		{"buffs",    tBuffs}
+		{"longName",  Tlo("Zone.Name")},
+		{"shortName", Tlo("Zone.ShortName")},
+		{"id",        TloInt("Zone.ID")}
 	};
 }
 
-// Compact state summary returned alongside every tool response so the LLM
-// always has situational awareness after acting. maxChat caps recent_chat to the
-// newest lines: action responses must not drag the whole 4000-line buffer along.
-static json BuildStateJson(const GameSnapshot& s, size_t maxChat = k_chatBufferSize)
-{
-	if (!s.inGame)
-		return {{"inGame", false}};
-
-	int hpPct  = s.hpMax  > 0 ? static_cast<int>(s.hp  * 100 / s.hpMax)  : 0;
-	int mnPct  = s.manaMax > 0 ? s.mana * 100 / s.manaMax : 0;
-	int endPct = s.enduranceMax > 0 ? s.endurance * 100 / s.enduranceMax : 0;
-
-	// Extended targets (confirmed aggressors in XTarget window)
-	json xtargets = json::array();
-	for (const GameSnapshot::XTargetEntry& xt : s.xTargets)
-		xtargets.push_back({{"name", xt.name}, {"level", xt.level}, {"distance", xt.distance}});
-
-	// Recent chat (the newest maxChat buffered lines)
-	json     chat = json::array();
-	uint64_t chatSeq;
-	{
-		std::lock_guard chatLock(s_chatMutex);
-		size_t skip = s_chatLines.size() > maxChat ? s_chatLines.size() - maxChat : 0;
-		for (auto it = s_chatLines.begin() + skip; it != s_chatLines.end(); ++it)
-			chat.push_back(it->text);
-		chatSeq = s_chatLastSeq;
-	}
-
-	// Memorized spells + recast readiness
-	json spells = json::array();
-	for (const GameSnapshot::SpellGem& sg : s.memSpells)
-		spells.push_back({{"gem", sg.gem}, {"name", sg.name}, {"id", sg.spellId},
-		                  {"ready", sg.msRemaining == 0}, {"ms_remaining", sg.msRemaining}});
-
-	// Loot available
-	json loot = json::array();
-	for (const GameSnapshot::LootEntry& le : s.lootItems)
-		loot.push_back({{"name", le.name}, {"noDrop", le.noDrop}, {"personal", le.personal}});
-
-	// Active buffs on self
-	json buffs = json::array();
-	for (const GameSnapshot::BuffEntry& b : s.buffs)
-		buffs.push_back({{"name", b.name}, {"id", b.spellId}, {"duration", b.duration}, {"song", b.song}});
-
-	json state = {
-		{"inGame",         true},
-		{"name",           s.playerName},
-		{"level",          s.playerLevel},
-		{"class",          s.playerClass},
-		{"hp_pct",         hpPct},
-		{"mana_pct",       mnPct},
-		{"endurance_pct",  endPct},
-		{"moving",         s.isMoving},
-		{"invisible",      s.isInvisible},
-		{"position",       {{"x", s.playerX}, {"y", s.playerY}, {"z", s.playerZ}}},
-		{"zone",           s.zoneShortName},
-		{"group_size",     static_cast<int>(s.groupMembers.size())},
-		{"aggro_count",    s.xTargetCount},
-		{"aggressors",     xtargets},
-		{"mem_spells",     spells},
-		{"active_buffs",   buffs},
-		{"loot_available", loot},
-		{"recent_chat",    chat},
-		{"chat_seq",       chatSeq}   // pass to chat_since to read only what comes after
-	};
-
-	if (s.hasTarget)
-	{
-		int tHpPct = s.targetHpMax > 0 ? static_cast<int>(s.targetHp * 100 / s.targetHpMax) : 0;
-		json tBuffs = json::array();
-		for (const GameSnapshot::BuffEntry& b : s.targetBuffs)
-			tBuffs.push_back({{"name", b.name}, {"id", b.spellId}});
-		state["target"] = {
-			{"name",     s.targetName},
-			{"type",     s.targetType},
-			{"distance", s.targetDist},
-			{"hp_pct",   tHpPct},
-			{"buffs",    tBuffs}
-		};
-	}
-
-	return state;
-}
-
-static json BuildSpawnsJson(const GameSnapshot& s)
+// Spell buffs on a spawn TLO that has Buff[n] (Me, Target). `count` stops the scan once
+// that many have been found, since slots can have gaps.
+static json BuffsJson(const std::string& owner, int firstSlot, int lastSlot, int64_t count, bool song)
 {
 	json arr = json::array();
-	for (const SpawnSnapshot& sp : s.spawns)
+	for (int i = firstSlot; i <= lastSlot && static_cast<int64_t>(arr.size()) < count; ++i)
 	{
+		std::string buff = fmt::format("{}[{}]", owner, i);
+		int64_t     id   = TloInt(buff + ".ID");
+		if (id <= 0)
+			continue;
+		json b = {{"name", Tlo(buff + ".Name")}, {"id", id}, {"seconds", TloInt(buff + ".Duration.TotalSeconds")}};
+		if (song)
+			b["song"] = true;
+		arr.push_back(std::move(b));
+	}
+	return arr;
+}
+
+static json BuildBuffsJson()
+{
+	json buffs = BuffsJson("Me.Buff", 1, static_cast<int>(TloInt("Me.MaxBuffSlots")), TloInt("Me.CountBuffs"), false);
+	for (json& s : BuffsJson("Me.Song", 1, MAX_TOTAL_BUFFS - NUM_LONG_BUFFS, TloInt("Me.CountSongs"), true))
+		buffs.push_back(std::move(s));
+	return buffs;
+}
+
+static json BuildTargetJson()
+{
+	if (TloInt("Target.ID") <= 0)
+		return nullptr;
+	int64_t buffCount = TloInt("Target.BuffCount");
+	return {
+		{"name",     Tlo("Target.CleanName")},
+		{"id",       TloInt("Target.ID")},
+		{"type",     Tlo("Target.Type")},
+		{"level",    TloInt("Target.Level")},
+		{"distance", TloFloat("Target.Distance3D")},
+		{"hp",       {{"current", TloInt("Target.CurrentHPs")}, {"max", TloInt("Target.MaxHPs")}, {"pct", TloInt("Target.PctHPs")}}},
+		{"buffs",    BuffsJson("Target.Buff", 1, static_cast<int>(buffCount), buffCount, false)}
+	};
+}
+
+// Gem numbers are 1-based, as /cast and Me.Gem[n] use them.
+static json BuildSpellsJson()
+{
+	json arr = json::array();
+	int  gems = static_cast<int>(TloInt("Me.NumGems"));
+	for (int i = 1; i <= gems; ++i)
+	{
+		int64_t id = TloInt(fmt::format("Me.Gem[{}].ID", i));
+		if (id <= 0)
+			continue;
 		arr.push_back({
-			{"id",       sp.id},
-			{"name",     sp.name},
-			{"type",     sp.type},
-			{"level",    sp.level},
-			{"distance", sp.distance},
-			{"position", {{"x", sp.x}, {"y", sp.y}, {"z", sp.z}}}
+			{"gem",          i},
+			{"name",         Tlo(fmt::format("Me.Gem[{}].Name", i))},
+			{"id",           id},
+			{"ready",        TloBool(fmt::format("Me.SpellReady[{}]", i))},
+			{"ms_remaining", TloInt(fmt::format("Me.GemTimer[{}].Raw", i))}
 		});
 	}
 	return arr;
+}
+
+static json BuildLootJson()
+{
+	json arr = json::array();
+	auto collect = [&](const char* list, const char* countMember, bool personal) {
+		int count = static_cast<int>(TloInt(fmt::format("AdvLoot.{}", countMember)));
+		for (int i = 1; i <= count; ++i)
+		{
+			std::string item = fmt::format("AdvLoot.{}[{}]", list, i);
+			arr.push_back({
+				{"name",      Tlo(item + ".Name")},
+				{"id",        TloInt(item + ".ID")},
+				{"noDrop",    TloBool(item + ".NoDrop")},
+				{"stackSize", TloInt(item + ".StackSize")},
+				{"personal",  personal}
+			});
+		}
+	};
+	collect("PList", "PCount", true);
+	collect("SList", "SCount", false);
+	return arr;
+}
+
+// Group.Member[0] is you; members 1-5 the rest. Spawn fields read 0 for offline members.
+static json BuildGroupJson()
+{
+	json arr = json::array();
+	if (TloInt("Me.GroupSize") == 0)
+		return arr;
+	for (int i = 0; i < MAX_GROUP_SIZE; ++i)
+	{
+		std::string m    = fmt::format("Group.Member[{}]", i);
+		std::string name = Tlo(m + ".Name");
+		if (name.empty())
+			continue;
+		arr.push_back({
+			{"name",       name},
+			{"level",      TloInt(m + ".Level")},
+			{"leader",     TloBool(m + ".Leader")},
+			{"mercenary",  TloBool(m + ".Mercenary")},
+			{"offline",    TloBool(m + ".Offline")},
+			{"other_zone", TloBool(m + ".OtherZone")},
+			{"hp_pct",     TloInt(m + ".PctHPs")},
+			{"mana_pct",   TloInt(m + ".PctMana")}
+		});
+	}
+	return arr;
+}
+
+// NPCs on the extended target window. XTarget slots can also hold group members, so
+// only NPC spawns in this zone count as aggressors.
+static json BuildAggressorsJson()
+{
+	json arr = json::array();
+	int  slots = static_cast<int>(TloInt("Me.XTargetSlots"));
+	for (int i = 1; i <= slots; ++i)
+	{
+		int64_t id = TloInt(fmt::format("Me.XTarget[{}].ID", i));
+		if (id <= 0)
+			continue;
+		std::string spawn = fmt::format("Spawn[id {}]", id);
+		if (Tlo(spawn + ".Type") != "NPC")
+			continue;
+		arr.push_back({
+			{"name",     Tlo(spawn + ".CleanName")},
+			{"id",       id},
+			{"level",    TloInt(spawn + ".Level")},
+			{"distance", TloFloat(spawn + ".Distance3D")}
+		});
+	}
+	return arr;
+}
+
+// Nearest spawns within 300 units, closest first, at most 60.
+static json BuildSpawnsJson()
+{
+	json arr   = json::array();
+	int  count = std::min(60, static_cast<int>(TloInt("SpawnCount[radius 300]")));
+	for (int i = 1; i <= count; ++i)
+	{
+		int64_t id = TloInt(fmt::format("NearestSpawn[{},radius 300].ID", i));
+		if (id <= 0)
+			continue;
+		std::string spawn = fmt::format("Spawn[id {}]", id);
+		arr.push_back({
+			{"id",       id},
+			{"name",     Tlo(spawn + ".CleanName")},
+			{"type",     Tlo(spawn + ".Type")},
+			{"level",    TloInt(spawn + ".Level")},
+			{"distance", TloFloat(spawn + ".Distance3D")},
+			{"position", PositionJson(spawn)}
+		});
+	}
+	return arr;
+}
+
+// get_state, and the state attached to action tool replies. Chat is left out unless
+// maxChat > 0 (chat_since is the way to read it); chat_seq is always there.
+static json BuildStateJson(size_t maxChat)
+{
+	uint64_t chatSeq = ChatLastSeq();
+	if (!InGame())
+		return {{"inGame", false}, {"chat_seq", chatSeq}};
+
+	json state = {
+		{"inGame",         true},
+		{"name",           Tlo("Me.CleanName")},
+		{"level",          TloInt("Me.Level")},
+		{"class",          Tlo("Me.Class.Name")},
+		{"hp_pct",         TloInt("Me.PctHPs")},
+		{"mana_pct",       TloInt("Me.PctMana")},
+		{"endurance_pct",  TloInt("Me.PctEndurance")},
+		{"moving",         TloBool("Me.Moving")},
+		{"invisible",      TloBool("Me.Invis")},
+		{"position",       PositionJson("Me")},
+		{"zone",           Tlo("Zone.ShortName")},
+		{"group_size",     TloInt("Me.GroupSize")},
+		{"mem_spells",     BuildSpellsJson()},
+		{"active_buffs",   BuildBuffsJson()},
+		{"loot_available", BuildLootJson()},
+		{"chat_seq",       chatSeq}   // pass to chat_since to read only what comes after
+	};
+	json aggressors = BuildAggressorsJson();
+	state["aggro_count"] = aggressors.size();
+	state["aggressors"]  = std::move(aggressors);
+
+	json target = BuildTargetJson();
+	if (!target.is_null())
+		state["target"] = {
+			{"name",     target["name"]},
+			{"type",     target["type"]},
+			{"distance", target["distance"]},
+			{"hp_pct",   target["hp"]["pct"]},
+			{"buffs",    target["buffs"]}
+		};
+
+	if (maxChat > 0)
+	{
+		json chat = json::array();
+		std::lock_guard lock(s_chatMutex);
+		size_t skip = s_chatLines.size() > maxChat ? s_chatLines.size() - maxChat : 0;
+		for (auto it = s_chatLines.begin() + skip; it != s_chatLines.end(); ++it)
+			chat.push_back(it->text);
+		state["recent_chat"] = std::move(chat);
+	}
+	return state;
+}
+
+// One builder's result, or err = "Not in game". The task captures nothing by reference:
+// after a timeout it can still run on a later pulse, when this frame is gone.
+static bool ReadGameState(json (*build)(), json& out, std::string& err)
+{
+	json wrapped;
+	if (!RunOnGameThread([build] { return InGame() ? json{{"data", build()}} : json(); }, wrapped, err))
+		return false;
+	if (wrapped.is_null())
+	{
+		err = "Not in game";
+		return false;
+	}
+	out = std::move(wrapped["data"]);
+	return true;
 }
 
 //============================================================================
@@ -1322,85 +1123,33 @@ static json HandleMCP(const json& req)
 	{
 		const std::string uri = req.value("/params/uri"_json_pointer, "");
 
-		std::lock_guard lock(s_snapshotMutex);
-		if (!s_snapshot.inGame)
-			return MakeError(id, -32000, "Not in game");
-
 		json content;
-		if      (uri == "eq://me")     content = BuildPlayerJson(s_snapshot);
-		else if (uri == "eq://zone")   content = BuildZoneJson(s_snapshot);
-		else if (uri == "eq://target") content = BuildTargetJson(s_snapshot);
-		else if (uri == "eq://spawns") content = BuildSpawnsJson(s_snapshot);
-		else if (uri == "eq://spells")
+		if (uri == "eq://chat")
 		{
-			json arr = json::array();
-			for (const GameSnapshot::SpellGem& sg : s_snapshot.memSpells)
-				arr.push_back({{"gem", sg.gem}, {"name", sg.name}, {"id", sg.spellId}});
-			content = arr;
-		}
-		else if (uri == "eq://chat")
-		{
-			json arr = json::array();
+			content = json::array();
 			std::lock_guard chatLock(s_chatMutex);
 			for (const ChatLine& line : s_chatLines)
-				arr.push_back(line.text);
-			content = arr;
+				content.push_back(line.text);
 		}
-		else if (uri == "eq://loot")
+		else
 		{
-			json arr = json::array();
-			for (const GameSnapshot::LootEntry& le : s_snapshot.lootItems)
-				arr.push_back({
-					{"name",      le.name},
-					{"noDrop",    le.noDrop},
-					{"stackable", le.stackable},
-					{"stackSize", le.stackSize},
-					{"personal",  le.personal}
-				});
-			content = arr;
+			// eq://spells and eq://cooldowns are the same list: gems with their recast state.
+			json (*build)() = nullptr;
+			if      (uri == "eq://me")        build = BuildPlayerJson;
+			else if (uri == "eq://zone")      build = BuildZoneJson;
+			else if (uri == "eq://target")    build = BuildTargetJson;
+			else if (uri == "eq://spawns")    build = BuildSpawnsJson;
+			else if (uri == "eq://spells")    build = BuildSpellsJson;
+			else if (uri == "eq://cooldowns") build = BuildSpellsJson;
+			else if (uri == "eq://loot")      build = BuildLootJson;
+			else if (uri == "eq://group")     build = BuildGroupJson;
+			else if (uri == "eq://buffs")     build = BuildBuffsJson;
+			else return MakeError(id, -32602, "Unknown resource URI: " + uri);
+
+			std::string err;
+			if (!ReadGameState(build, content, err))
+				return MakeError(id, -32000, err);
 		}
-		else if (uri == "eq://group")
-		{
-			json arr = json::array();
-			for (const GameSnapshot::GroupMember& gm : s_snapshot.groupMembers)
-				arr.push_back({
-					{"name",     gm.name},
-					{"owner",    gm.ownerName},
-					{"level",    gm.level},
-					{"type",     gm.type},
-					{"offline",  gm.offline},
-					{"leader",   gm.isLeader},
-					{"hp_pct",   gm.hpPct},
-					{"mana_pct", gm.manaPct}
-				});
-			content = arr;
-		}
-		else if (uri == "eq://buffs")
-		{
-			json arr = json::array();
-			for (const GameSnapshot::BuffEntry& b : s_snapshot.buffs)
-				arr.push_back({
-					{"name",     b.name},
-					{"id",       b.spellId},
-					{"duration", b.duration},
-					{"song",     b.song}
-				});
-			content = arr;
-		}
-		else if (uri == "eq://cooldowns")
-		{
-			json arr = json::array();
-			for (const GameSnapshot::SpellGem& sg : s_snapshot.memSpells)
-				arr.push_back({
-					{"gem",          sg.gem},
-					{"name",         sg.name},
-					{"id",           sg.spellId},
-					{"ready",        sg.msRemaining == 0},
-					{"ms_remaining", sg.msRemaining}
-				});
-			content = arr;
-		}
-		else return MakeError(id, -32602, "Unknown resource URI: " + uri);
 
 		return MakeOk(id, {{"contents", {{
 			{"uri",      uri},
@@ -1414,8 +1163,14 @@ static json HandleMCP(const json& req)
 		return MakeOk(id, {{"tools", {
 			{
 				{"name",        "get_state"},
-				{"description", "Get current game state: name, level, class, HP%, mana%, endurance%, movement, zone, target, buffs, spells, loot, and recent chat. Call this after any action to check the result."},
-				{"inputSchema", {{"type","object"},{"properties",json::object()}}}
+				{"description", "Get current game state: name, level, class, HP%, mana%, endurance%, movement, zone, "
+				                "target (with buffs), XTarget aggressors, memorized spells with recast state, buffs, "
+				                "loot and group size. Read live through MQ's TLOs on one game frame. Chat is not "
+				                "included by default: use chat_since with the returned chat_seq, or max_chat."},
+				{"inputSchema", {
+					{"type",       "object"},
+					{"properties", {{"max_chat", {{"type","integer"},{"description","Also return this many of the newest chat lines (default 0)"}}}}}
+				}}
 			},
 			{
 				{"name",        "execute_command"},
@@ -1455,8 +1210,7 @@ static json HandleMCP(const json& req)
 				{"description", "Evaluate a MacroQuest TLO expression and return its value as a string. "
 				                "Accepts either a bare expression (Me.Name, Navigation.Setting[OpenDoors]) "
 				                "or a full macro string with ${} (e.g. \"${Me.Name} is level ${Me.Level}\"). "
-				                "Unlike get_state this reads live via MQ's parser, so it works even when the "
-				                "state snapshot is disabled. Note TLO index syntax uses [brackets], not (parens): "
+				                "Note TLO index syntax uses [brackets], not (parens): "
 				                "Navigation.Setting[OpenDoors], not Navigation.Setting(OpenDoors). "
 				                "Returns JSON with the value and a 'resolved' flag that is false when the TLO "
 				                "did not evaluate (MQ yields NULL or echoes the expression back)."},
@@ -1585,13 +1339,15 @@ static json HandleMCP(const json& req)
 		const std::string tool = req.value("/params/name"_json_pointer, "");
 		const json        args = req.value("/params/arguments"_json_pointer, json::object());
 
-		// Helper: build a response that includes current game state. The command has
-		// only been queued, so its own output is not in chat yet; a short tail is enough.
-		// chatSeq, taken *before* queueing, replaces the snapshot's: the pulse may run the
-		// command before the state is built, and its output must land after the cursor.
+		// Helper: build a response that includes current game state, built on the pulse that
+		// runs the queued command (commands drain first), so it reflects the command having
+		// been issued; a short chat tail rides along. chatSeq, taken *before* queueing,
+		// replaces the state's own: the command's output must land after the cursor.
 		auto respondWithState = [&](std::string msg, uint64_t chatSeq) {
-			std::lock_guard lock(s_snapshotMutex);
-			json state = BuildStateJson(s_snapshot, k_actionChatLines);
+			json        state;
+			std::string err;
+			if (!RunOnGameThread([] { return BuildStateJson(k_actionChatLines); }, state, err))
+				state = {{"error", err}};
 			state["chat_seq"] = chatSeq;
 			std::string text = msg + "\n\nCurrent state:\n" + state.dump(2);
 			return MakeOk(id, {{"content", {{{"type","text"},{"text", std::move(text)}}}}});
@@ -1599,8 +1355,13 @@ static json HandleMCP(const json& req)
 
 		if (tool == "get_state")
 		{
-			std::lock_guard lock(s_snapshotMutex);
-			json state = BuildStateJson(s_snapshot);
+			size_t maxChat = 0;
+			if (args.contains("max_chat") && args["max_chat"].is_number_integer())
+				maxChat = static_cast<size_t>(std::clamp<int64_t>(args["max_chat"].get<int64_t>(), 0, k_chatBufferSize));
+			json        state;
+			std::string err;
+			if (!RunOnGameThread([maxChat] { return BuildStateJson(maxChat); }, state, err))
+				return MakeError(id, -32000, err);
 			return MakeOk(id, {{"content", {{{"type","text"},{"text", state.dump(2)}}}}});
 		}
 
@@ -2051,15 +1812,16 @@ static void SetupRoutes()
 	// -----------------------------------------------------------------------
 	// Convenience read-only REST endpoints (useful for debugging)
 	// -----------------------------------------------------------------------
-	auto gameGet = [](httplib::Response& res, auto buildFn) {
-		std::lock_guard lock(s_snapshotMutex);
-		if (!s_snapshot.inGame)
+	auto gameGet = [](httplib::Response& res, json (*build)()) {
+		json        out;
+		std::string err;
+		if (!ReadGameState(build, out, err))
 		{
 			res.status = 503;
-			res.set_content(R"({"error":"not in game"})", "application/json");
+			res.set_content(json{{"error", err}}.dump(), "application/json");
 			return;
 		}
-		res.set_content(buildFn(s_snapshot).dump(2), "application/json");
+		res.set_content(out.dump(2), "application/json");
 	};
 
 	s_server->Get("/me",     [gameGet](const httplib::Request&, httplib::Response& res) { gameGet(res, BuildPlayerJson); });
@@ -2103,6 +1865,10 @@ static void StopServer()
 		{
 			std::lock_guard lock(s_tloMutex);
 			std::queue<std::shared_ptr<TloQuery>>().swap(s_tloQueue);
+		}
+		{
+			std::lock_guard lock(s_taskMutex);
+			std::queue<std::shared_ptr<GameTask>>().swap(s_taskQueue);
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 	}
@@ -2227,18 +1993,6 @@ static void Cmd_MCPStatus(PlayerClient* /*pChar*/, const char* szLine)
 	GetArg(arg1, szLine, 1);
 	GetArg(arg2, szLine, 2);
 
-	// /mcp snapshot on|off   enable the struct-reading state snapshot (saved in the ini)
-	if (ci_equals(arg1, "snapshot"))
-	{
-		if (ci_equals(arg2, "on") || ci_equals(arg2, "off"))
-		{
-			s_snapshotEnabled = ci_equals(arg2, "on");
-			::WritePrivateProfileStringA("Settings", "Snapshot", s_snapshotEnabled ? "1" : "0", INIFileName);
-		}
-		WriteChatf("\ag[MQMCP]\ax Snapshot is \ay%s\ax   (/mcp snapshot on|off)", s_snapshotEnabled ? "on" : "off");
-		return;
-	}
-
 	// /mcp chat reload   re-read this character's chat tab layout from the UI ini
 	if (ci_equals(arg1, "chat"))
 	{
@@ -2307,30 +2061,18 @@ static void Cmd_MCPStatus(PlayerClient* /*pChar*/, const char* szLine)
 		chatDepth = static_cast<int>(s_chatLines.size());
 	}
 
-	// Game state summary
-	bool inGame = false;
+	// Game state summary (commands run on the game thread, so the TLOs can be read directly)
+	bool inGame = InGame();
 	std::string charInfo;
-	{
-		std::lock_guard lock(s_snapshotMutex);
-		inGame = s_snapshot.inGame;
-		if (inGame)
-		{
-			int hpPct = s_snapshot.hpMax > 0
-				? static_cast<int>(s_snapshot.hp * 100 / s_snapshot.hpMax) : 0;
-			int mnPct = s_snapshot.manaMax > 0
-				? s_snapshot.mana * 100 / s_snapshot.manaMax : 0;
-			charInfo = fmt::format("{} ({}), zone: {}, HP: {}%, mana: {}%",
-				s_snapshot.playerName, s_snapshot.playerLevel,
-				s_snapshot.zoneShortName, hpPct, mnPct);
-		}
-	}
+	if (inGame)
+		charInfo = fmt::format("{} ({}), zone: {}, HP: {}%, mana: {}%", Tlo("Me.CleanName"),
+			Tlo("Me.Level"), Tlo("Zone.ShortName"), Tlo("Me.PctHPs"), Tlo("Me.PctMana"));
 
 	WriteChatf("\ag[MQMCP]\ax ─────────────────────────────────");
 	int pin = PinnedPort(CurrentCharName());
 	WriteChatf("\ag[MQMCP]\ax  URL    : \ayhttp://127.0.0.1:%d/mcp\ax  (%s)", s_port.load(),
 		pin > 0 ? fmt::format("pinned {}", pin).c_str() : "auto");
 	WriteChatf("\ag[MQMCP]\ax  Uptime : \aw%02d:%02d:%02d\ax", hours, minutes, secs);
-	WriteChatf("\ag[MQMCP]\ax  Snap   : \aw%s\ax  (/mcp snapshot on|off)", s_snapshotEnabled ? "on" : "off");
 	WriteChatf("\ag[MQMCP]\ax  Game   : %s", inGame ? fmt::format("\aw{}\ax", charInfo).c_str() : "\arNot in game\ax");
 	WriteChatf("\ag[MQMCP]\ax  Queue  : \aw%d\ax pending command(s)", queueDepth);
 	WriteChatf("\ag[MQMCP]\ax  Chat   : \aw%d\ax / %d lines buffered", chatDepth, (int)k_chatBufferSize);
@@ -2360,7 +2102,6 @@ PLUGIN_API BOOL OnIncomingChat(const char* Line, DWORD Color)
 PLUGIN_API void InitializePlugin()
 {
 	s_startTime = std::chrono::steady_clock::now();
-	s_snapshotEnabled = ::GetPrivateProfileIntA("Settings", "Snapshot", 0, INIFileName) != 0;
 
 	// Loaded in game: go straight to the pinned port. Loaded at char select: auto for
 	// now, and OnPulse moves us to the pin once the character is known.
@@ -2383,9 +2124,6 @@ PLUGIN_API void ShutdownPlugin()
 
 PLUGIN_API void OnPulse()
 {
-	// Refresh game state snapshot
-	UpdateSnapshot();
-
 	// Drain and execute queued commands on the main thread
 	std::queue<QueuedCommand> toRun;
 	{
@@ -2435,6 +2173,21 @@ PLUGIN_API void OnPulse()
 		// set_value throws if the promise was already satisfied or the future
 		// was abandoned; a throw escaping OnPulse would take the client down.
 		try { q->result.set_value(std::move(values)); } catch (...) {}
+	}
+
+	// Drain game-state builds (get_state, eq:// resources, REST). After the commands, so a
+	// state requested alongside a command already reflects it.
+	std::queue<std::shared_ptr<GameTask>> tasks;
+	{
+		std::lock_guard lock(s_taskMutex);
+		std::swap(tasks, s_taskQueue);
+	}
+	while (!tasks.empty())
+	{
+		auto task = std::move(tasks.front());
+		tasks.pop();
+		try { task->result.set_value(task->build()); }
+		catch (...) { try { task->result.set_exception(std::current_exception()); } catch (...) {} }
 	}
 
 	// Apply the character's pinned port and load its chat layout once per entry into the
