@@ -1145,6 +1145,132 @@ static json BuildSpawnsJson(const GameSnapshot& s)
 }
 
 //============================================================================
+// Client registry -- which character is on which port
+//
+// Each client records itself in MQMCP_Clients.ini as [Clients] <port>=<name>,<server>,<pid>
+// (name and server are empty at char select). It is a separate file from MQMCP.ini on
+// purpose: the profile API rewrites the whole file on every write, so clients writing at
+// the same moment can drop each other's change. That is harmless here -- every client
+// rechecks its entry every few seconds and rewrites it -- but not for pins and settings.
+// An entry can outlive a crashed client, so readers confirm each one with GET /whoami.
+//============================================================================
+
+struct ClientIdentity
+{
+	std::string name;     // empty at char select
+	std::string server;
+};
+
+static ClientIdentity s_identity;   // set on the game thread (OnPulse), read by HTTP workers
+static std::mutex     s_identityMutex;
+
+static const std::string& ClientsIniPath()
+{
+	static const std::string path = fmt::format("{}\\MQMCP_Clients.ini", gPathConfig);
+	return path;
+}
+
+static std::string ClientEntry()
+{
+	std::lock_guard lock(s_identityMutex);
+	return fmt::format("{},{},{}", s_identity.name, s_identity.server, ::GetCurrentProcessId());
+}
+
+static std::string ReadClientEntry(int port)
+{
+	char buf[256] = { 0 };
+	::GetPrivateProfileStringA("Clients", std::to_string(port).c_str(), "", buf, sizeof(buf), ClientsIniPath().c_str());
+	return buf;
+}
+
+// Write our entry if it is missing or differs: out of date, or lost to another client's write.
+static void PublishClient()
+{
+	int port = s_port;
+	if (!port)
+		return;
+	std::string entry = ClientEntry();
+	if (ReadClientEntry(port) != entry)
+		::WritePrivateProfileStringA("Clients", std::to_string(port).c_str(), entry.c_str(), ClientsIniPath().c_str());
+}
+
+// Remove the entry for a port we are leaving, unless another process has taken it over since.
+static void UnpublishClient(int port)
+{
+	if (!port)
+		return;
+	std::string entry = ReadClientEntry(port);
+	if (entry.ends_with(fmt::format(",{}", ::GetCurrentProcessId())))
+		::WritePrivateProfileStringA("Clients", std::to_string(port).c_str(), nullptr, ClientsIniPath().c_str());
+}
+
+static json WhoamiJson()
+{
+	std::lock_guard lock(s_identityMutex);
+	return {
+		{"name",    s_identity.name},
+		{"server",  s_identity.server},
+		{"in_game", !s_identity.name.empty()},
+		{"port",    s_port.load()},
+		{"pid",     ::GetCurrentProcessId()}
+	};
+}
+
+// Every registered client, confirmed live with GET /whoami. The checks run in parallel,
+// since a dead port costs the whole connect timeout. Entries that don't answer are removed.
+static json ListClients()
+{
+	std::vector<char> buf(16 * 1024);
+	DWORD len = ::GetPrivateProfileSectionA("Clients", buf.data(), static_cast<DWORD>(buf.size()), ClientsIniPath().c_str());
+
+	struct Probe { int port; std::string entry; std::future<json> answer; };
+	std::vector<Probe> probes;
+	for (const char* p = buf.data(); p < buf.data() + len && *p; p += strlen(p) + 1)
+	{
+		std::string_view kv(p);
+		size_t eq = kv.find('=');
+		int port = eq == std::string_view::npos ? 0 : GetIntFromString(std::string(kv.substr(0, eq)), 0);
+		if (port <= 0)
+			continue;
+		if (port == s_port)
+		{
+			std::promise<json> self;
+			self.set_value(WhoamiJson());
+			probes.push_back({port, std::string(kv.substr(eq + 1)), self.get_future()});
+			continue;
+		}
+		probes.push_back({port, std::string(kv.substr(eq + 1)), std::async(std::launch::async, [port] {
+			httplib::Client cli("127.0.0.1", port);
+			cli.set_connection_timeout(0, 300000);
+			cli.set_read_timeout(2, 0);
+			auto res = cli.Get("/whoami");
+			if (!res || res->status != 200)
+				return json();
+			json j = json::parse(res->body, nullptr, false);
+			return j.is_discarded() ? json() : j;
+		})});
+	}
+
+	json clients = json::array();
+	int  removed = 0;
+	for (Probe& probe : probes)
+	{
+		json who = probe.answer.get();
+		if (who.is_object())
+		{
+			who["self"] = probe.port == s_port;
+			clients.push_back(std::move(who));
+		}
+		else if (ReadClientEntry(probe.port) == probe.entry)
+		{
+			::WritePrivateProfileStringA("Clients", std::to_string(probe.port).c_str(), nullptr, ClientsIniPath().c_str());
+			++removed;
+		}
+	}
+	return {{"clients", std::move(clients)}, {"removed_stale", removed}};
+}
+
+//============================================================================
 // MCP JSON-RPC 2.0 handler
 //============================================================================
 
@@ -1428,6 +1554,27 @@ static json HandleMCP(const json& req)
 						{"timeout_ms", {{"type","integer"},{"description","Give up after this long, 0-60000 (default 5000)"}}}
 					}},
 					{"required",   {"expr"}}
+				}}
+			},
+			{
+				{"name",        "list_clients"},
+				{"description", "List the EQ clients running this plugin on this machine: character name "
+				                "(empty at char select), server, MCP port and process id, each confirmed live. "
+				                "'self' marks this client."},
+				{"inputSchema", {{"type","object"},{"properties",json::object()}}}
+			},
+			{
+				{"name",        "query_peer"},
+				{"description", "Evaluate TLO expressions on another character's client (by name), all on one "
+				                "of its game frames -- query_tlo_batch run on that client. Use instead of "
+				                "DanNet /dquery or /dex round trips."},
+				{"inputSchema", {
+					{"type",       "object"},
+					{"properties", {
+						{"name",  {{"type","string"}, {"description","Character name, case-insensitive"}}},
+						{"exprs", {{"type","array"},  {"items",{{"type","string"}}}, {"description","TLO expressions, each with or without surrounding ${}"}}}
+					}},
+					{"required",   {"name", "exprs"}}
 				}}
 			}
 		}}});
@@ -1752,6 +1899,51 @@ static json HandleMCP(const json& req)
 			return MakeOk(id, {{"content", {{{"type","text"},{"text", out.dump(2)}}}}});
 		}
 
+		if (tool == "list_clients")
+		{
+			json out = ListClients();
+			return MakeOk(id, {{"content", {{{"type","text"},{"text", out.dump(2)}}}}});
+		}
+
+		if (tool == "query_peer")
+		{
+			const std::string name = args.value("name", "");
+			if (name.empty())
+				return MakeError(id, -32602, "name is required");
+			if (!args.contains("exprs") || !args["exprs"].is_array())
+				return MakeError(id, -32602, "exprs must be an array of strings");
+
+			int  port    = 0;
+			json clients = ListClients();   // named: looping over ListClients()["clients"] would outlive the temporary
+			for (const json& c : clients["clients"])
+				if (ci_equals(c.value("name", ""), name))
+					port = c.value("port", 0);
+			if (!port)
+				return MakeError(id, -32000, fmt::format("{} is not on any running client (see list_clients)", name));
+
+			// The peer answers on its next pulse, within its own 5s TLO timeout.
+			httplib::Client cli("127.0.0.1", port);
+			cli.set_connection_timeout(1, 0);
+			cli.set_read_timeout(8, 0);
+			json call = {{"jsonrpc","2.0"}, {"id",1}, {"method","tools/call"},
+			             {"params", {{"name","query_tlo_batch"}, {"arguments", {{"exprs", args["exprs"]}}}}}};
+			auto res = cli.Post("/mcp", call.dump(), "application/json");
+			if (!res || res->status != 200)
+				return MakeError(id, -32000, fmt::format("{} on port {} did not answer", name, port));
+			json reply = json::parse(res->body, nullptr, false);
+			if (reply.is_discarded())
+				return MakeError(id, -32000, "Unreadable reply from " + name);
+			if (reply.contains("error"))
+				return MakeError(id, reply["error"].value("code", -32000), name + ": " + reply["error"].value("message", ""));
+
+			json out = json::parse(reply.value("/result/content/0/text"_json_pointer, std::string("{}")), nullptr, false);
+			if (out.is_discarded())
+				return MakeError(id, -32000, "Unreadable reply from " + name);
+			out["name"] = name;
+			out["port"] = port;
+			return MakeOk(id, {{"content", {{{"type","text"},{"text", out.dump(2)}}}}});
+		}
+
 		return MakeError(id, -32601, "Unknown tool: " + tool);
 	}
 
@@ -1846,6 +2038,11 @@ static void SetupRoutes()
 		res.set_content(json{{"resource", fmt::format("http://127.0.0.1:{}", s_port.load())}}.dump(), "application/json");
 	});
 
+	// Which character this port belongs to. Cheap, and answers at char select too.
+	s_server->Get("/whoami", [](const httplib::Request&, httplib::Response& res) {
+		res.set_content(WhoamiJson().dump(), "application/json");
+	});
+
 	s_server->Get("/.well-known/oauth-authorization-server", [](const httplib::Request&, httplib::Response& res) {
 		res.status = 404;
 		res.set_content(R"({"error":"not_found"})", "application/json");
@@ -1875,11 +2072,11 @@ static void SetupRoutes()
 // Server lifecycle / port selection
 //============================================================================
 
-// httplib 0.15.3's default_socket_options sets SO_REUSEADDR and *then*
-// SO_EXCLUSIVEADDRUSE on Windows. Winsock rejects that combination (WSAEINVAL on the
-// second call, unchecked), leaving a plain REUSEADDR socket -- so every boxed client
-// bound 8284 and the newest silently took over connections. Exclusive only, so a port
-// already in use fails to bind and we move on to the next.
+// httplib's default socket options leave a REUSEADDR socket on Windows: 0.15.3 set
+// SO_REUSEADDR then SO_EXCLUSIVEADDRUSE (Winsock rejects the second, unchecked), and
+// 0.41 sets SO_REUSEADDR alone. Either way every boxed client bound 8284 and the newest
+// silently took over connections. Exclusive only, so a port already in use fails to
+// bind and we move on to the next.
 static void ExclusiveSocketOptions(socket_t sock)
 {
 	int yes = 1;
@@ -1918,6 +2115,7 @@ static void StopServer()
 		s_serverThread = nullptr;
 	}
 	s_server.reset();
+	UnpublishClient(s_port);
 	s_port = 0;
 }
 
@@ -1927,22 +2125,28 @@ static int StartServer(int preferred)
 {
 	StopServer();
 
-	s_server = std::make_unique<httplib::Server>();
-	s_server->set_socket_options(ExclusiveSocketOptions);
-	SetupRoutes();
+	// A fresh Server per attempt: in httplib 0.41 a failed bind_to_port decommissions
+	// the Server, and every later bind on it fails without trying -- so one taken port
+	// (a pin, or 8284 held by another client) used to end the scan with "no free port".
+	auto tryBind = [](int p) {
+		s_server = std::make_unique<httplib::Server>();
+		s_server->set_socket_options(ExclusiveSocketOptions);
+		SetupRoutes();
+		if (s_server->bind_to_port("127.0.0.1", p))
+			return true;
+		s_server.reset();
+		return false;
+	};
 
 	int port = 0;
-	if (preferred > 0 && s_server->bind_to_port("127.0.0.1", preferred))
+	if (preferred > 0 && tryBind(preferred))
 		port = preferred;
 	for (int p = k_defaultPort; !port && p < k_defaultPort + k_portSpan; ++p)
-		if (s_server->bind_to_port("127.0.0.1", p))
+		if (tryBind(p))
 			port = p;
 
 	if (!port)
-	{
-		s_server.reset();
 		return 0;
-	}
 
 	s_stopping   = false;
 	s_listenDone = false;
@@ -1954,6 +2158,7 @@ static int StartServer(int preferred)
 	// stop() is a no-op until the listener is running, so a stop racing a fresh start
 	// would leave join() waiting forever. Don't return until it is up.
 	s_server->wait_until_ready();
+	PublishClient();
 	return port;
 }
 
@@ -1962,6 +2167,15 @@ static std::string CurrentCharName()
 	if (GetGameState() != GAMESTATE_INGAME || !pLocalPlayer)
 		return {};
 	return pLocalPlayer->Name;
+}
+
+static void SetIdentity(ClientIdentity id)
+{
+	{
+		std::lock_guard lock(s_identityMutex);
+		s_identity = std::move(id);
+	}
+	PublishClient();
 }
 
 static int PinnedPort(const std::string& name)
@@ -2231,13 +2445,25 @@ PLUGIN_API void OnPulse()
 	if (CurrentCharName().empty())
 	{
 		if (s_pinChecked)
+		{
 			LoadChatLayout();   // not in game: clears it, so char-select lines aren't tagged with old tabs
+			SetIdentity({});
+		}
 		s_pinChecked = false;
 	}
 	else if (!s_pinChecked)
 	{
 		s_pinChecked = true;
 		LoadChatLayout();
+		SetIdentity({CurrentCharName(), GetServerShortName()});
 		ApplyPinnedPort();
+	}
+
+	// Re-assert our registry entry now and then, in case another client's write dropped it.
+	static auto s_nextPublish = std::chrono::steady_clock::now();
+	if (std::chrono::steady_clock::now() >= s_nextPublish)
+	{
+		s_nextPublish = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		PublishClient();
 	}
 }

@@ -14,6 +14,7 @@ Game state is read each server pulse (main thread) and cached for lock-free acce
 |--------|------|-------------|
 | `POST` | `/mcp` | MCP JSON-RPC 2.0 endpoint |
 | `GET`  | `/mcp` | SSE keepalive stream (for streaming MCP clients) |
+| `GET`  | `/whoami` | `{name, server, in_game, port, pid}` for the client on this port (name is empty at char select) |
 | `GET`  | `/me` | Debug: player state JSON |
 | `GET`  | `/zone` | Debug: zone info JSON |
 | `GET`  | `/target` | Debug: current target JSON |
@@ -141,6 +142,23 @@ Waits until a TLO expression becomes true. It checks the expression on every gam
 | `timeout_ms` | integer | Give up after this long, 0–60000 (default 5000) |
 
 When `equals` is not given, the condition is true if the value is `TRUE` or a non-zero number. `NULL`, `FALSE`, `0` and unresolved expressions count as false. For example, `{"expr": "Navigation.Active", "equals": "FALSE"}` waits for nav to finish, and `{"expr": "Me.Casting", "equals": "NULL"}` waits for a cast to end. For comparisons, use a TLO that evaluates them: `"${Math.Calc[${Me.PctHPs} > 80]}"`. The result is `{expr, met, value, resolved, elapsed_ms, polls}`, and `met: false` means it timed out.
+
+---
+
+### `list_clients`
+Lists the EQ clients on this machine that run the plugin. Each entry is that client's `/whoami` answer: `name` (empty at char select), `server`, `in_game`, `port` and `pid`, plus `self: true` for the client you asked. Every entry is confirmed live. Entries for clients that no longer answer are removed from the registry, and `removed_stale` counts them. See [Client registry](#client-registry).
+
+---
+
+### `query_peer`
+Runs `query_tlo_batch` on another character's client, found by name through the registry, and returns its results with that character's `name` and `port` added.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `name` | string | Character name, case-insensitive |
+| `exprs` | string[] | TLO expressions, as for `query_tlo_batch` |
+
+This replaces DanNet round trips such as `/dquery` or `/dex ... /dt` for reading another box's state.
 
 ## State Fields
 
@@ -458,7 +476,13 @@ Every boxed client loads its own copy of the plugin, so each one needs a differe
 
 The scan range is set by `k_defaultPort` and `k_portSpan` in `MQMCP.cpp`.
 
-**Why the server binds with `SO_EXCLUSIVEADDRUSE` only:** cpp-httplib 0.15.3's default socket options set `SO_REUSEADDR` and then `SO_EXCLUSIVEADDRUSE` on Windows. Winsock rejects that combination. The second call fails, httplib doesn't check the result, and the socket is left as plain `SO_REUSEADDR`. As a result, every client successfully bound `8284`, and the newest one silently took over its connections. With exclusive-only binding, a port that is already in use fails to bind and the server moves on to the next one. Don't go back to httplib's defaults.
+### Client registry
+
+Each client records which port it is on in `config/MQMCP_Clients.ini`, as `[Clients] <port>=<name>,<server>,<pid>`. The name and server are empty at char select. A client writes its entry when it binds a port and when it enters or leaves the game, and removes the entry when it stops. Scripts can read this file to find a character's port, including an unpinned one. Use `list_clients` from an MCP client.
+
+The registry is its own file rather than a section of `MQMCP.ini`. The Windows profile API rewrites the whole file on each write, so two clients writing at once can lose one of the changes. In the registry that fixes itself, because every client checks its entry every 5 seconds and rewrites it if it's missing. In `MQMCP.ini` it could drop a port pin. An entry can outlive a client that crashed, so confirm it with `GET /whoami` before trusting it. `list_clients` does this and removes the dead entries.
+
+**Why the server binds with `SO_EXCLUSIVEADDRUSE` only:** cpp-httplib's default socket options leave a plain `SO_REUSEADDR` socket on Windows. Version 0.41 sets `SO_REUSEADDR` alone. Version 0.15.3 set `SO_REUSEADDR` and then `SO_EXCLUSIVEADDRUSE`, but Winsock rejects that combination, the second call fails, and httplib doesn't check the result. As a result, every client successfully bound `8284`, and the newest one silently took over its connections. With exclusive-only binding, a port that is already in use fails to bind and the server moves on to the next one. Don't go back to httplib's defaults.
 
 `eq_agent.py` connects to `MCP_URL`, which is set near the top of the script to `http://127.0.0.1:8284`. Change it to drive a character on another port.
 

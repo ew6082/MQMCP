@@ -46,12 +46,19 @@ OnPulse, and unloading from within its own callback is unsafe.
   and rebinds immediately; `/mcp port auto` clears the pin. `/mcp` shows port + pin.
 - Unpinned clients take the first free port in 8284–8315. A plugin loaded at char select
   starts on auto, and OnPulse moves it to the pin once the character is known.
-- Binding is `SO_EXCLUSIVEADDRUSE` only. httplib 0.15.3's default sets `SO_REUSEADDR`
-  then `SO_EXCLUSIVEADDRUSE`, which Winsock rejects (unchecked), leaving a REUSEADDR
-  socket — every client bound 8284 and the newest silently took over. Don't revert it.
-- Current pins: Terminaar 8280, Vtan 8281, Davran 8282 — all below the auto range on
-  purpose, so an unpinned client can never take a pinned character's port. Put new
-  pins at 8283 and below, not inside 8284–8315.
+- Binding is `SO_EXCLUSIVEADDRUSE` only. httplib's defaults leave a REUSEADDR socket on
+  Windows (0.15.3: REUSEADDR then EXCLUSIVEADDRUSE, which Winsock rejects unchecked;
+  0.41: REUSEADDR alone) — every client bound 8284 and the newest silently took over.
+  Don't revert it.
+- vcpkg now installs httplib **0.41.0**, where a failed `bind_to_port` decommissions the
+  `Server` and every later bind on it fails. `StartServer` therefore makes a fresh
+  `Server` per port tried; reusing one ended the scan at the first taken port with "No
+  free port in 8284-8315" (2026-10-29: every unpinned client after Domolite on 8284).
+- Pins (2026-10-29): Terminaar 8280, Vtan 8281, Davran 8282, Sundarr 8270, Grookka 8271,
+  Warzan 8278, Tarkas 8279 — all below the auto range on purpose, so an unpinned client
+  can never take a pinned character's port. Put new pins below 8284, not inside 8284–8315.
+- `config/MQMCP_Clients.ini` (`[Clients] <port>=<name>,<server>,<pid>`) records which
+  client is on which port; `list_clients` / `GET /whoami` / `query_peer` read it.
   The rip `.mcp.json` (gitignored, local only) registers them as `everquest`,
   `everquest-vtan` and `everquest-davran`.
 
@@ -75,19 +82,17 @@ In order of payoff. Chat sequence numbers, `chat_since`, `run_command` and `wait
 done and confirmed live (2026-10-27). The rip scripts keep their `/echo` markers: they
 also tell the user what's happening in the MQ chat window. Read them from the MCP with
 `chat_since` (`tabs: ["MQ"]` + `filter`); any extra instrumentation for that is separate work.
+Port discovery (`MQMCP_Clients.ini`, `GET /whoami`, `list_clients`, `query_peer`) is done
+and confirmed live on all 12 clients (2026-10-29).
 
-1. **Port discovery.** There's no way to list which character is on which port without
-   probing 8284–8315. Write a `[Clients]` table to the shared ini on bind and/or add
-   `GET /whoami` (name/server, cheap; `/me` returns zeros at char select). A
-   `query_peer(name, expr)` could then remove the DanNet `/dex` + tell workaround.
-2. **Slimmer `get_state`.** It still returns the full chat buffer (action tools now send
+1. **Slimmer `get_state`.** It still returns the full chat buffer (action tools now send
    only the last 20 lines). With `chat_since` available, chat could go from get_state
    entirely (keep `chat_seq`), or become opt-in (`max_chat`).
-3. **Build `get_state` from TLOs** (one `query_tlo_batch`-style evaluation) instead of
+2. **Build `get_state` from TLOs** (one `query_tlo_batch`-style evaluation) instead of
    struct reads, so an EQ patch can't crash it and the snapshot toggle can go.
-4. **`navigate_to` by spawn/target** (`/nav id`, `/nav target`), optionally waiting until
+3. **`navigate_to` by spawn/target** (`/nav id`, `/nav target`), optionally waiting until
    nav ends (via `wait_for`).
-5. **Protocol version.** It reports `2024-11-05`. Moving to Streamable HTTP would let the
+4. **Protocol version.** It reports `2024-11-05`. Moving to Streamable HTTP would let the
    SSE keepalive stub go. Not urgent while Claude Code accepts it.
 
 ## Chat tabs
@@ -109,7 +114,7 @@ does a deploy, let them do it unless they ask; they often copy and reload themse
 - TLO index syntax uses `[brackets]`; nested brackets inside `DanNet[x].Q[...]` do not
   resolve (`Me.Gem[1].Name` came back NULL). `DanNet.Q` also only returns values already
   fetched by `/dquery`. To read a peer, `/noparse /dex <peer> /dt <me> ${...}` and read the
-  tell back from chat — or just query that peer's own MCP port.
+  tell back from chat — or just use `query_peer(name, exprs)`.
 - From Git Bash, a command string starting with `/` is mangled into a Windows path
   (`/target` → `C:/Program Files/Git/target`). Send commands from Python or PowerShell.
 - Bard song/resist messages only reach `recent_chat` if the client's chat filters show them.
