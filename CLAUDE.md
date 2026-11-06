@@ -44,7 +44,7 @@ OnPulse, and unloading from within its own callback is unsafe.
 
 - `/mcp port <n>` pins this character (stored in `MQMCP.ini`, `[Ports] <Name>=<n>`)
   and rebinds immediately; `/mcp port auto` clears the pin. `/mcp` shows port + pin.
-- Unpinned clients take the first free port in 8284–8315. A plugin loaded at char select
+- Unpinned clients take the first free port in 8284–8355. A plugin loaded at char select
   starts on auto, and OnPulse moves it to the pin once the character is known.
 - Binding is `SO_EXCLUSIVEADDRUSE` only. httplib's defaults leave a REUSEADDR socket on
   Windows (0.15.3: REUSEADDR then EXCLUSIVEADDRUSE, which Winsock rejects unchecked;
@@ -56,7 +56,7 @@ OnPulse, and unloading from within its own callback is unsafe.
   free port in 8284-8315" (2026-10-29: every unpinned client after Domolite on 8284).
 - Pins (2026-10-29): Terminaar 8280, Vtan 8281, Davran 8282, Sundarr 8270, Grookka 8271,
   Warzan 8278, Tarkas 8279 — all below the auto range on purpose, so an unpinned client
-  can never take a pinned character's port. Put new pins below 8284, not inside 8284–8315.
+  can never take a pinned character's port. Put new pins below 8284, not inside 8284–8355.
 - `config/MQMCP_Clients.ini` (`[Clients] <port>=<name>,<server>,<pid>`) records which
   client is on which port; `list_clients` / `GET /whoami` / `query_peer` read it.
   The rip `.mcp.json` (gitignored, local only) registers them as `everquest`,

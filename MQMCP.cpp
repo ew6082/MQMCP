@@ -62,7 +62,7 @@ using json = nlohmann::json;
 // pinned port from [Ports] <CharName>=<port> in the plugin ini when it has one (set with
 // /mcp port <n>), otherwise the first free port in k_defaultPort..+k_portSpan-1.
 static constexpr int k_defaultPort = 8284;
-static constexpr int k_portSpan    = 32;
+static constexpr int k_portSpan    = 72;   // 8284-8355: room for big boxing setups
 static std::atomic<int>  s_port{0};          // 0 = not listening
 static std::atomic<bool> s_stopping{false};  // tells long-lived handlers (SSE) to bail
 static std::chrono::steady_clock::time_point s_startTime;
@@ -114,8 +114,12 @@ static std::queue<std::shared_ptr<TloQuery>> s_tloQueue;
 static std::mutex                            s_tloMutex;
 
 // Guards against one request monopolising a frame; MQ's parser is not free and
-// OnPulse blocks rendering.
-static constexpr size_t k_maxTloBatch = 64;
+// OnPulse blocks rendering. Self-imposed, not an MQ limit. It was 64 (upstream, never
+// measured); 128 is still modest next to what the builders already evaluate in one
+// frame: eq://spawns is ~8 TLOs x up to 60 spawns (~480), get_state 100+ (gems, buffs,
+// songs, XTargets, target buffs, loot). query_peer inherits it. Raise it further only
+// against measured per-frame timings.
+static constexpr size_t k_maxTloBatch = 128;
 
 //============================================================================
 // Chat ring buffer — fed by OnWriteChatColor, read by HTTP thread
@@ -1228,7 +1232,7 @@ static json HandleMCP(const json& req)
 				                "disagree (position vs target vs distance). Same syntax and 'resolved' "
 				                "semantics as query_tlo, one result object per expression in request order. "
 				                "Example: [\"Me.Y\",\"Me.X\",\"Target.CleanName\",\"Target.Distance\"]. "
-				                "Limit 64 expressions per call."},
+				                "Limit 128 expressions per call."},
 				{"inputSchema", {
 					{"type",       "object"},
 					{"properties", {{"exprs", {

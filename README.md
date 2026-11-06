@@ -6,23 +6,34 @@ A MacroQuest plugin that exposes EverQuest game state and character control via 
 
 MQMCP runs a local HTTP server on `localhost`, one port per EverQuest client: the character's pinned port if it has one, otherwise the first free port from `8284` (see [Ports](#ports)). It speaks JSON-RPC 2.0 over the `/mcp` endpoint, making it compatible with any MCP client or custom agent.
 
-Game state is read each server pulse (main thread) and cached for lock-free access by HTTP clients. Commands are queued from the HTTP thread and executed on the next pulse, keeping everything thread-safe and EQ-compatible.
+HTTP requests never touch the game directly. Commands, TLO queries and state reads are queued from the HTTP thread and run on the next game pulse (main thread), in that order, and the request waits for the result — up to 5 seconds, after which it fails with "Timed out waiting for the game thread" (a frozen client, or the plugin shutting down).
 
 ## Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/mcp` | MCP JSON-RPC 2.0 endpoint |
-| `GET`  | `/mcp` | SSE keepalive stream (for streaming MCP clients) |
-| `GET`  | `/whoami` | `{name, server, in_game, port, pid}` for the client on this port (name is empty at char select) |
-| `GET`  | `/me` | Debug: player state JSON |
-| `GET`  | `/zone` | Debug: zone info JSON |
-| `GET`  | `/target` | Debug: current target JSON |
-| `GET`  | `/spawns` | Debug: nearby spawns JSON |
+| `GET`  | `/mcp` | SSE stream that only sends a keepalive comment every 15 s. The server never pushes messages; Claude Code requires the stream to exist. |
+| `GET`  | `/whoami` | `{name, server, in_game, port, pid}` for the client on this port (name is empty at char select). Answers without waiting for a pulse. |
+| `GET`  | `/me` | Debug: same JSON as `eq://me` |
+| `GET`  | `/zone` | Debug: same JSON as `eq://zone` |
+| `GET`  | `/target` | Debug: same JSON as `eq://target` (`null` with no target) |
+| `GET`  | `/spawns` | Debug: same JSON as `eq://spawns` |
+| `GET`  | `/.well-known/oauth-protected-resource` | Minimal metadata (`{resource}`), so MCP clients don't try OAuth |
+| `GET`  | `/.well-known/oauth-authorization-server` | Always 404: there is no authentication |
+
+The debug endpoints return 503 with `{"error": "Not in game"}` at char select.
+
+### JSON-RPC details
+
+- `initialize` reports protocol version `2024-11-05` and server `MQMCP` 1.0, with the `tools` and `resources` capabilities.
+- Methods: `initialize`, `tools/list`, `tools/call`, `resources/list`, `resources/read`. Notifications (`notifications/*` without an `id`) get HTTP 204 and no body.
+- A body that isn't valid JSON gets HTTP 400 with JSON-RPC error `-32700`. Missing or invalid tool arguments give `-32602`; game-thread failures ("Not in game", timeouts) give `-32000`.
+- Tool results are one `text` content item. For every tool except `execute_command`, `navigate_to` and `say`, that text is a JSON document.
 
 ## In-Game Command
 
-Type `/mcp` in EverQuest to display server status: URL (with whether the port is pinned or auto), uptime, character info, pending command queue depth, and chat buffer count.
+Type `/mcp` in EverQuest to display server status: URL (with whether the port is pinned or auto), uptime, character info, pending command queue depth, and chat buffer count. On load, the plugin prints the URL it is listening on, or why it couldn't bind (a pinned port in use, or no free port in the auto range).
 
 | Command | Effect |
 |---------|--------|
@@ -55,29 +66,51 @@ Executes any MacroQuest or EverQuest slash command on the next game pulse.
 |-----------|------|-------------|
 | `command` | string | Full command including leading slash, e.g. `/cast 1`, `/attack on` |
 
-Commands are queued and executed in order on the next EQ pulse. The response includes the game state read on that same pulse, just after the command was issued, with the last 20 chat lines. Its `chat_seq` is taken before the command was queued, so `chat_since` with that value returns the command's output. To get the output in one call, use `run_command`.
+Commands are queued and executed in order on the next EQ pulse. The response is plain text, `Queued: <command>`, followed by the game state read on that same pulse, just after the command was issued, with the last 20 chat lines as `recent_chat`. Its `chat_seq` is taken before the command was queued, so `chat_since` with that value returns the command's output. To get the output in one call, use `run_command`.
 
 ---
 
 ### `navigate_to`
-Navigates to world coordinates using MQ2Nav (must be loaded).
+Navigates to world coordinates using MQ2Nav (must be loaded). It sends `/nav loc <y> <x> <z>` and returns at once, like `execute_command`, with `Navigating: <command>` and the state. To wait for arrival, follow it with `wait_for` on `Navigation.Active` equals `FALSE`.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `y` | number | North/South coordinate |
 | `x` | number | East/West coordinate |
-| `z` | number | Up/Down coordinate (optional) |
+| `z` | number | Up/Down coordinate (optional; 0 when left out) |
 
 Accepts both numeric and string values for coordinates.
 
 ---
 
 ### `say`
-Says text in local `/say` chat (visible to nearby players).
+Says text in local `/say` chat (visible to nearby players). Same reply format as `execute_command`, starting `Said: <text>`.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `text` | string | Text to say |
+
+---
+
+### `query_tlo`
+Evaluates one MacroQuest TLO expression on the game thread and returns its value as a string.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `expr` | string | A bare expression (`Me.Name`, `Navigation.Setting[OpenDoors]`) or a macro string with `${}` (`"${Me.Name} is level ${Me.Level}"`) |
+
+A bare expression is wrapped in `${}`; anything that already contains `${` is parsed as given. TLO indexes use `[brackets]`, not parentheses. The result is `{expr, value, resolved}`. `resolved` is `false` when MQ returned `NULL` or echoed the expression back unevaluated, so a `NULL` is never mistaken for a real value.
+
+---
+
+### `query_tlo_batch`
+Evaluates up to 128 TLO expressions on the same game frame. The limit is set by `k_maxTloBatch` in `MQMCP.cpp`. It isn't an MQ limit: it keeps one request from taking up a whole frame.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `exprs` | string[] | Expressions, with the same syntax as `query_tlo` |
+
+The result is `{count, results: [{expr, value, resolved}, ...]}`, in request order. Prefer it over several `query_tlo` calls: each call costs a round trip and a pulse, and values read on different frames can disagree (your position, the target's position, the distance between them). This is also the way to read anything the state doesn't include, such as combat abilities (see [Combat Abilities / Disciplines](#combat-abilities--disciplines)).
 
 ---
 
@@ -131,6 +164,8 @@ Pass `next` as `since` on the next call. `next` moves past filtered-out lines to
 ### `chat_tabs`
 Lists this client's chat tabs and the channels that are routed to each one.
 
+The result is `{loaded, file, tabs: {"<tab name>": ["<channel>", ...]}}`. A tab with no name in the ini is listed as `Window <n>`.
+
 The layout comes from the character's UI ini in the EverQuest folder. For a character with personas, that's the file for the current class, `UI_<Name>_<server>_<CLS>.ini`. Otherwise it's `UI_<Name>_<server>.ini`. The plugin reads the file when you enter the game and when you run `/mcp chat reload`. EQ only writes tab changes to the file when you camp, so a change you make in game shows up after you log in again.
 
 ---
@@ -165,7 +200,7 @@ This replaces DanNet round trips such as `/dquery` or `/dex ... /dt` for reading
 
 ## State Fields
 
-The `get_state` tool (and the inline state returned with each command) returns:
+The `get_state` tool (and the inline state returned with each command) returns the following. At char select or while zoning it returns only `{"inGame": false, "chat_seq": ...}`. `target` is left out when you have no target.
 
 ```json
 {
@@ -239,20 +274,20 @@ The `get_state` tool (and the inline state returned with each command) returns:
 
 ## MCP Resources
 
-In addition to tools, the server exposes MCP resources for granular reads:
+In addition to tools, the server exposes MCP resources for granular reads. Each is read through TLOs on one game frame when requested; at char select, reading any of them except `eq://chat` fails with "Not in game".
 
-| URI | Description |
-|-----|-------------|
-| `eq://me` | Full player stats (HP, mana, endurance, position, class, level) |
-| `eq://zone` | Current zone name and ID |
-| `eq://target` | Current target details |
-| `eq://spawns` | All spawns within 300 units, sorted by distance |
-| `eq://spells` | Memorized spell gems with recast state |
+| URI | Returns |
+|-----|---------|
+| `eq://me` | `{name, level, class, classId, invisible, position, hp, mana, endurance}`, where `hp`, `mana` and `endurance` are each `{current, max, pct}` |
+| `eq://zone` | `{longName, shortName, id}` |
+| `eq://target` | `{name, id, type, level, distance, hp: {current, max, pct}, buffs}`, or `null` with no target |
+| `eq://spawns` | Up to 60 spawns within 300 units, closest first: `[{id, name, type, level, distance, position}]` |
+| `eq://spells` | Memorized gems, as `mem_spells` in `get_state` |
 | `eq://cooldowns` | Same as `eq://spells` |
-| `eq://buffs` | Active buffs and songs on self |
-| `eq://loot` | Items currently in the AdvLoot window |
-| `eq://group` | Group members with HP%, mana%, level, and role |
-| `eq://chat` | Buffered chat, up to 4000 lines |
+| `eq://buffs` | Buffs then songs, as `active_buffs` in `get_state` |
+| `eq://loot` | AdvLoot items, as `loot_available` in `get_state` |
+| `eq://group` | `[{name, level, leader, mercenary, offline, other_zone, hp_pct, mana_pct}]`, you first; empty when ungrouped |
+| `eq://chat` | The whole chat buffer (up to 4000 lines) as an array of plain text strings, without `seq` or tags. Use `chat_since` for anything incremental. |
 
 ## Chat Capture
 
@@ -261,6 +296,10 @@ MQMCP captures chat from two sources:
 - **`OnIncomingChat`** — All game chat channels (combat hits, spell results, XP messages, say, group, etc.)
 
 MQ color codes (`0x07` + letter) and non-ASCII bytes are stripped so all strings are valid UTF-8.
+
+Each line is tagged with its channel and chat tab when it arrives (see `chat_since`). The table that maps EQ colors to channels is written by hand. The entries marked `guess` in the comment block above `ChannelFromColor` in `MQMCP.cpp` haven't been checked in game yet.
+
+The buffer holds the newest 4000 lines. It starts empty when the plugin loads, and sequence numbers start again at 1.
 
 ## Combat Abilities / Disciplines
 
@@ -415,15 +454,17 @@ Add one server entry per character to your MCP client config, each pointing at t
 }
 ```
 
-Pin these ports below the auto range (8284–8315). Otherwise, an unpinned client that starts first can take a pinned character's port.
+Pin these ports below the auto range (8284–8355). Otherwise, an unpinned client that starts first can take a pinned character's port.
 
 Pin each character's port (`/mcp port <n>`) so the entries stay correct no matter which order the clients start in.
 
-All tools (`get_state`, `execute_command`, `navigate_to`, `say`) will be available to any connected MCP client.
+Every tool listed above is available to any connected MCP client.
 
 ## Usage with a Python Agent
 
 `eq_agent.py` is a standalone Python orchestrator that connects directly to MQMCP over HTTP and drives the character using an LLM agentic loop.
+
+> **Out of date.** The script comes from upstream and was written against the old state format. Its prompt expects `abilities`, `quests` and 100 lines of `recent_chat` in `get_state`, and none of these are returned now. It uses only `get_state`, `execute_command`, `navigate_to` and `say`. It needs updating, for example to `chat_since`, `run_command` and `query_tlo_batch`, before it can be relied on.
 
 ```bash
 pip install anthropic httpx
@@ -444,7 +485,7 @@ python eq_agent.py "Kill gnolls; loot everything; meditate when low mana"
 Every boxed client loads its own copy of the plugin, so each one needs a different port.
 
 - **Pinned:** `/mcp port <n>` saves the pin in `MQMCP.ini` as `[Ports] <CharName>=<n>`. You can also edit that section by hand. If the pinned port is already taken, the server falls back to auto and says so in chat.
-- **Auto:** An unpinned client binds the first free port in `8284`–`8315`. The client that starts first gets the lowest port, so auto ports can change between sessions.
+- **Auto:** An unpinned client binds the first free port in `8284`–`8355`. The client that starts first gets the lowest port, so auto ports can change between sessions.
 - **Loaded at char select:** The character isn't known yet, so the server starts on auto. Once you enter the game, it moves to that character's pinned port.
 
 The scan range is set by `k_defaultPort` and `k_portSpan` in `MQMCP.cpp`.
